@@ -25,6 +25,7 @@ import re
 import torch
 import inspect
 from collections import defaultdict
+from contextlib import nullcontext
 from unsloth_zoo.rl_replacements import RL_REPLACEMENTS
 RL_EXTRA_ARGS      = defaultdict(list)
 RL_FUNCTIONS       = defaultdict(list)
@@ -243,7 +244,7 @@ def grpo_generate_and_score_completions(function_name, function):
     re.MULTILINE
     )
 
-    replacement = """                    if self.use_vision : prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask,pixel_values = pixel_values,image_grid_thw=image_grid_thw, generation_config=self.generation_config)
+    replacement = """                    if self.use_vision : prompt_completion_ids = unwrapped_model.generate(**vision_inputs, generation_config=self.generation_config)
                     else : prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config)"""
 
     function = pattern.sub(replacement, function)
@@ -256,9 +257,9 @@ def grpo_generate_and_score_completions(function_name, function):
         re.MULTILINE
     )
 
-    replacement = """                old_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw, logits_to_keep, batch_size
-                        )"""
+    replacement = """                old_per_token_logps = self._get_per_token_logps_and_entropies(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep, pixel_values, image_grid_thw
+                        )["logps"]"""
 
     function = re.sub(pattern, replacement, function)
 
@@ -308,9 +309,61 @@ def grpo_generate_and_score_completions(function_name, function):
                 padding_side="left",
                 add_special_tokens=False,
                 return_tensors='pt'
-            )"""
+            )
+            vision_inputs = super()._prepare_inputs(vision_inputs)
+            vision_inputs = vision_inputs.to(self.model.device)
+            prompt_ids, prompt_mask = vision_inputs["input_ids"], vision_inputs["attention_mask"]"""
 
     function = pattern.sub(replacement, function)
+
+    # 6. Add pattern to extract vision inputs before the with torch.no_grad() block
+    pattern = re.compile(
+        r"(logits_to_keep = completion_ids\.size\(1\).*?# we only need to compute the logits for the completion tokens\n"
+        r"(?P<indent>\s*)batch_size = self\.args\.per_device_train_batch_size if mode == \"train\" else self\.args\.per_device_eval_batch_size\n)"
+        r"(\s*with torch\.no_grad\(\):)",
+        re.DOTALL
+    )
+
+    replacement = r'\1\2# Extract vision inputs if available\n\2pixel_values = vision_inputs.get("pixel_values", None) if self.use_vision else None\n\2image_grid_thw = vision_inputs.get("image_grid_thw", None) if self.use_vision else None\n\n\3'
+
+    function = re.sub(pattern, replacement, function)
+
+        # 7. Replace old_per_token_logps calculation with vision parameters (already done in pattern 3)
+    # But need to update the pattern to handle the updated function signature
+    pattern = re.compile(
+        r'old_per_token_logps = self\._get_per_token_logps_and_entropies\(\n'
+        r'(\s*)self\.model, prompt_completion_ids, attention_mask, logits_to_keep(?:, batch_size)?\n'
+        r'(\s*)\)\["logps"\]',
+        re.MULTILINE
+    )
+
+    replacement = r'old_per_token_logps = self._get_per_token_logps_and_entropies(\n\1self.model, prompt_completion_ids, attention_mask, logits_to_keep, pixel_values, image_grid_thw\n\2)["logps"]'
+
+    function = re.sub(pattern, replacement, function)
+
+    # 8. Replace ref_per_token_logps calculations with vision parameters
+    pattern = re.compile(
+        r'ref_per_token_logps = self\._get_per_token_logps_and_entropies\(\n'
+        r'(\s*)self\.ref_model, prompt_completion_ids, attention_mask, logits_to_keep\n'
+        r'(\s*)\)\["logps"\]',
+        re.MULTILINE
+    )
+
+    replacement = r'ref_per_token_logps = self._get_per_token_logps_and_entropies(\n\1self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep, pixel_values, image_grid_thw\n\2)["logps"]'
+
+    function = re.sub(pattern, replacement, function)
+
+    # 9. Replace ref_per_token_logps calculation with disable_adapter
+    pattern = re.compile(
+        r'ref_per_token_logps = self\._get_per_token_logps_and_entropies\(\n'
+        r'(\s*)self\.model, prompt_completion_ids, attention_mask, logits_to_keep\n'
+        r'(\s*)\)\["logps"\]',
+        re.MULTILINE
+    )
+
+    replacement = r'ref_per_token_logps = self._get_per_token_logps_and_entropies(\n\1self.model, prompt_completion_ids, attention_mask, logits_to_keep, pixel_values, image_grid_thw\n\2)["logps"]'
+
+    function = re.sub(pattern, replacement, function)
 
     # Add mixed precision training
     function = function.replace(
@@ -354,7 +407,7 @@ def grpo_prepare_inputs(function_name, function):
 
     return function
 pass
-RL_FUNCTIONS["grpo_trainer"].append(grpo_prepare_inputs)
+# RL_FUNCTIONS["grpo_trainer"].append(grpo_prepare_inputs)
 
 
 # Remove _move_model_to_vllm
@@ -370,12 +423,12 @@ RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__move_model_to_vllm)
 
 
 # Edit _get_per_token_logps to handle mixed precision
-def grpo_trainer__get_per_token_logps(function_name, function):
-    if function_name != "_get_per_token_logps": return function
+def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+    if function_name != "_get_per_token_logps_and_entropies": return function
 
-    def _get_per_token_logps(self, model, input_ids, attention_mask, pixel_values, image_grid_thw, logits_to_keep):
-        if True: # os.environ.get('UNSLOTH_USE_NEW_MODEL', '0') == '0':
-            return None # Unsloth efficient GRPO
+    def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep, pixel_values=None, image_grid_thw=None):
+        # if True: # os.environ.get('UNSLOTH_USE_NEW_MODEL', '0') == '0':
+        #     return None # Unsloth efficient GRPO
         # Otherwise, calculate normally:
         if not hasattr(self, '_autocast_dtype'):
             self._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
@@ -384,13 +437,23 @@ def grpo_trainer__get_per_token_logps(function_name, function):
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
         with torch.amp.autocast(device_type = 'cuda', dtype = self._autocast_dtype):
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-            logits = model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                logits_to_keep = logits_to_keep + 1,
-            ).logits
+            if pixel_values is not None:
+                logits = model(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    pixel_values = pixel_values,
+                    image_grid_thw = image_grid_thw,
+                    logits_to_keep = logits_to_keep + 1,
+                ).logits
+            else:
+                logits = model(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    logits_to_keep = logits_to_keep + 1,
+                ).logits
             # logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-            return logits
+            # Return a dictionary with "logps" key to match the expected format
+            return {"logps": logits}
             # input_ids = input_ids[:, -logits_to_keep:]
             # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
             # See https://github.com/huggingface/trl/issues/2770
@@ -410,10 +473,10 @@ def grpo_trainer__get_per_token_logps(function_name, function):
         pass
     pass
 
-    function = inspect.getsource(_get_per_token_logps)
+    function = inspect.getsource(_get_per_token_logps_and_entropies)
     return function
 pass
-RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__get_per_token_logps)
+RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__get_per_token_logps_and_entropies)
 
 grpo_compute_loss      = RL_REPLACEMENTS["grpo_compute_loss"]
 grpo_compute_loss_slow = RL_REPLACEMENTS["grpo_compute_loss_slow"]
@@ -444,14 +507,14 @@ def grpo_trainer_compute_loss(function_name, function):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         _input_ids = input_ids
         _logits_to_keep = logits_to_keep
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, pixel_values, image_grid_thw, logits_to_keep)
+        per_token_logps = self._get_per_token_logps_and_entropies(model, input_ids, attention_mask,logits_to_keep, pixel_values, image_grid_thw)["logps"]
 
         # Compute the KL divergence between the model and the reference model
         # _prepare_inputs doesn't return reference log probs anymore. We need to calculate it ourselves.
         # https://github.com/huggingface/trl/blob/05bc43e960396581e458195b8388efe6b82cae1f/trl/trainer/grpo_trainer.py#L1328
         if self.beta != 0.0:
             with torch.inference_mode(), model.disable_adapter():
-                ref_per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, pixel_values, image_grid_thw, logits_to_keep)
+                ref_per_token_logps = self._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, pixel_values, image_grid_thw)["logps"]
         else:
             ref_per_token_logps = None
         # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
