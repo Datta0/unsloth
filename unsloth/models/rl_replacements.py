@@ -175,7 +175,7 @@ def grpo_generate_and_score_completions(function_name, function):
     import re
     # This matches the function signature, decorators and any comments immediately following
     pattern = r"(\s*@profiling_decorator\s*\n\s*def _prepare_inputs\s*\([^\)]*\)\s*(->\s*[^:]+)?\s*:\s*\n(?:[ ]*#[^\n]*\n)*)"
-    
+
     match = re.search(pattern, function)
     insert = (
         "        if hasattr(self, 'llm'):\n"
@@ -194,7 +194,7 @@ def grpo_generate_and_score_completions(function_name, function):
             rest_of_function,
             flags=re.DOTALL | re.MULTILINE
         )
-        
+
         # We also need to remove the old wake up call from the beginning of the function
         # since it's injected before the comments.
         header_and_comments = re.sub(
@@ -208,7 +208,7 @@ def grpo_generate_and_score_completions(function_name, function):
 
     if """prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]""" not in function:
         return function
-    
+
 
     # 1. Output pixel_values and image_grid_thw
     pattern = re.compile(
@@ -245,7 +245,7 @@ def grpo_generate_and_score_completions(function_name, function):
 
     replacement = """                    if self.use_vision : prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask,pixel_values = pixel_values,image_grid_thw=image_grid_thw, generation_config=self.generation_config)
                     else : prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config)"""
-    
+
     function = pattern.sub(replacement, function)
 
     # 3. Replace the old_per_token_logps generation
@@ -281,14 +281,36 @@ def grpo_generate_and_score_completions(function_name, function):
             prompt_inputs = self.processing_class(text=prompts_text, return_tensors='pt', padding=True, padding_side="left", add_special_tokens=False)
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
         else:
-            images = [x['image'] for x in inputs]  # Only image inputs support for now 
+            images = [x['image'] for x in inputs]  # Only image inputs support for now
             prompt_inputs = self.processing_class(images=images, text=prompts_text, return_tensors='pt', padding=True, padding_side="left", add_special_tokens=False)
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             pixel_values, image_grid_thw = prompt_inputs['pixel_values'], prompt_inputs['image_grid_thw']"""
 
     function = pattern.sub(replacement, function)
 
+    # 5. Replace prompt_ids, prompt_mask extraction to support vision
+    pattern = re.compile(
+        r"^(?P<indent>\s*)prompt_ids, prompt_mask = prompt_inputs\[\"input_ids\"\], prompt_inputs\[\"attention_mask\"\]",
+        re.MULTILINE
+    )
 
+    replacement = """        if not self.use_vision:
+            prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+        else:
+            images = [x['image'] for x in inputs]
+            texts = [self.processing_class.apply_chat_template(x['prompt'], tokenize=False, add_generation_prompt=True) for x in inputs]
+
+            # Tokenize with images directly
+            vision_inputs = self.processing_class(
+                images=images,
+                text=texts,
+                padding=True,
+                padding_side="left",
+                add_special_tokens=False,
+                return_tensors='pt'
+            )"""
+
+    function = pattern.sub(replacement, function)
 
     # Add mixed precision training
     function = function.replace(
@@ -322,10 +344,10 @@ def grpo_prepare_inputs(function_name, function):
     if  function_name != "_prepare_inputs": return function
 
     if "generation_batch = self._generate_and_score_completions(generation_batch)" not in function : return function
-    
+
     function = function.replace(
         "generation_batch = self._generate_and_score_completions(generation_batch)",
-        
+
         "generation_batch = self._generate_and_score_completions(generation_batch)\n"\
         "                if self.use_vision : generation_batch['pixel_values']=generation_batch['pixel_values'].view(generation_batch['prompt_ids'].size(0), -1, generation_batch['pixel_values'].size(1)) # (batch_size * n_patches, dim embedding)->(batch_size,n_patches,dim embeddding)"
     )
@@ -414,14 +436,14 @@ def grpo_trainer_compute_loss(function_name, function):
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         pixel_values, image_grid_thw = inputs.get("pixel_values", None), inputs.get("image_grid_thw", None)
-        
+
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         bsz, qlen = input_ids.shape
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         # attention_mask = None
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         _input_ids = input_ids
-        _logits_to_keep = logits_to_keep  
+        _logits_to_keep = logits_to_keep
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, pixel_values, image_grid_thw, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
