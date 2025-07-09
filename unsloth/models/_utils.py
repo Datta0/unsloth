@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "2025.6.12"
+__version__ = "2025.7.1"
 
 __all__ = [
     "SUPPORTS_BFLOAT16",
@@ -183,6 +183,8 @@ except:
 try:
     from transformers.generation.utils import logger as transformers_generation_utils_logger
     transformers_generation_utils_logger.addFilter(HideLoggingMessage("Setting `pad_token_id` to `eos_token_id`"))
+    # "You have set `compile_config`
+    transformers_generation_utils_logger.addFilter(HideLoggingMessage("compile_config"))
     del transformers_generation_utils_logger
 except:
     pass
