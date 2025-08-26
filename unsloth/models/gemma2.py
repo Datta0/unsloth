@@ -144,10 +144,35 @@ def Gemma2Attention_fast_forward(
         )
         A = A.reshape(bsz, q_len, n_heads*head_dim)
     else:
-        fx = slow_inference_attention_softcapping \
-            if "_flag_for_generation" in kwargs else \
-            slow_attention_softcapping
-        A = fx(Q, K, V, causal_mask, self, bsz, kv_seq_len)
+        # Use the shared attention with softcap support
+        from ._utils_attention import scaled_dot_product_attention_softcap
+        
+        # Determine sliding window
+        sliding_window = None
+        if has_sliding_window:
+            sliding_window = getattr(self.config, "sliding_window", None)
+            sliding_window = kv_seq_len if (sliding_window is None or sliding_window == "null") else sliding_window
+        
+        # Reshape for grouped-query attention
+        if n_groups != 1:
+            K_expanded = K[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
+            V_expanded = V[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
+            K = K_expanded.reshape(bsz, n_heads, kv_seq_len, head_dim)
+            V = V_expanded.reshape(bsz, n_heads, kv_seq_len, head_dim)
+        pass
+        
+        # Must be contiguous or else results are False!
+        Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
+        
+        # Compute attention with softcap
+        A = scaled_dot_product_attention_softcap(
+            Q, K, V,
+            attn_mask=attention_mask,
+            is_causal=True,
+            scale=1.0 / (self.config.query_pre_attn_scalar**0.5),
+            softcap=self.config.attn_logit_softcapping,
+        )
+        A = A.transpose(1, 2).reshape(bsz, q_len, n_heads*head_dim)
     pass
     A = self.apply_o(self, A)
     return A, None, past_key_value
@@ -334,32 +359,24 @@ def Gemma2Attention_fast_forward_inference(
         Knn, Vnn = Kn, Vn
     pass
 
-    # Grouped query attention
-    _, _, cached_len, _ = Knn.shape
-    if n_groups != 1:
-        Knn = Knn[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, cached_len, head_dim)
-        Vnn = Vnn[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, cached_len, head_dim)
-        Knn = Knn.reshape(bsz, n_heads, cached_len, head_dim)
-        Vnn = Vnn.reshape(bsz, n_heads, cached_len, head_dim)
-    pass
-    # else:
-    #     Knn, Vnn = Knn, Vnn
-    # pass
-
-    # Attention
-    # if bsz == 1:
-    Qn *= self.scalar # See https://github.com/ggerganov/llama.cpp/issues/7805#issuecomment-2153349963
-    # It seems like doing (Q * scalar) @ K is better than (Q @ K) * scalar to stop overflows
-    A = torch_matmul(Qn, Knn.transpose(2, 3), out = self.attention[:,:,:,:cached_len])
-    # if attention_mask is not None: A += attention_mask # Must add attention_mask for batched
-
-    A *= self.reciprocal_t; torch_tanh(A, out = A); A *= self.t;  # Logit softcapping
-
-    A[:] = torch_nn_functional_softmax(A, dim = -1, dtype = torch.float32)#.to(A.dtype)
-    A = torch_matmul(A, Vnn, out = Qn)
-    # else:
-    #     A = scaled_dot_product_attention(Qn, Knn, Vnn, attn_mask = attention_mask, is_causal = False)
-    # pass
+    # Use the new shared attention computation function for inference
+    from ._utils_attention import compute_attention_matrix_inference
+    A = compute_attention_matrix_inference(
+        Qn=Qn,
+        Kn=Knn,
+        Vn=Vnn,
+        K1=K1,
+        V1=V1,
+        attention=self.attention,
+        scalar=self.scalar,
+        n_groups=n_groups,
+        n_kv_heads=n_kv_heads,
+        n_heads=n_heads,
+        cached_len=Knn.shape[2],
+        sliding_window=sliding_window if use_sliding_window else None,
+        attention_mask=attention_mask,
+    )
+    
     A = A.transpose(1, 2)
     A = A.reshape(bsz, 1, attention_size)
     A = fast_linear_forward(self.o_proj, A, out = self.temp_O)

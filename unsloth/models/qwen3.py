@@ -126,71 +126,23 @@ def Qwen3Attention_fast_forward(
     pass
     past_key_value = (K, V) if use_cache else None
 
-    # Attention module
-    if (not HAS_FLASH_ATTENTION and HAS_XFORMERS and attention_mask is None):
-        # Xformers memory efficient attention
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        K_M = V_M = bsz * kv_seq_len
-        Q_M = bsz * q_len
-
-        has_swa = isinstance(causal_mask, xformers.attn_bias.BlockDiagonalCausalMask)
-
-        # Group query attention
-        K = K  .view(bsz, kv_seq_len, n_kv_heads,        1, head_dim)
-        V = V  .view(bsz, kv_seq_len, n_kv_heads,        1, head_dim)
-        K = K.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
-        V = V.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
-        if hidden_states.requires_grad:
-            K = K.reshape(bsz, kv_seq_len, n_heads, head_dim)
-            V = V.reshape(bsz, kv_seq_len, n_heads, head_dim)
-
-            if has_swa:
-                Q = Q.view(1, Q_M, n_heads, head_dim)
-                K = K.view(1, K_M, n_heads, head_dim)
-                V = V.view(1, V_M, n_heads, head_dim)
-            pass
-        else:
-            # Xformers does support the forward pass though
-            Q = Q.view(bsz, q_len, n_kv_heads, n_groups, head_dim)
-
-            if has_swa:
-                Q = Q.view(1, Q_M, n_kv_heads, n_groups, head_dim)
-                K = K.view(1, K_M, n_kv_heads, n_groups, head_dim)
-                V = V.view(1, V_M, n_kv_heads, n_groups, head_dim)
-            pass
-        pass
-
-        A = xformers_attention(Q, K, V, attn_bias = causal_mask)
-        A = A.view(bsz, q_len, n_heads, head_dim)
-
-    elif HAS_FLASH_ATTENTION and attention_mask is None:
-        Q = Q.transpose(1, 2)
-        K = K.transpose(1, 2)
-        V = V.transpose(1, 2)
-        sw = kv_seq_len
-        window = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
-        A = flash_attn_func(Q, K, V, causal = True, window_size = window)
-    else:
-        # Grouped query attention
-        # if n_groups != 1:
-        K = K[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
-        V = V[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
-        K = K.reshape(bsz, n_heads, kv_seq_len, head_dim)
-        V = V.reshape(bsz, n_heads, kv_seq_len, head_dim)
-        # pass
-        # Must be contiguous or else results are False!
-        # https://github.com/pytorch/pytorch/issues/112577
-        Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-        # Needs (batch_size, n_heads, seq_len, head_dim)
-        # is_casual and attention_mask must not be both set!
-        A = scaled_dot_product_attention(Q, K, V, attn_mask = attention_mask, is_causal = False)
-        # Go back to (batch_size, seq_len, n_heads, head_dim)
-        A = A.transpose(1, 2).contiguous()
-    pass
-
-    attn_output = A.reshape(bsz, q_len, n_heads*head_dim)
+    # Use the new shared attention computation
+    from ._utils_attention import compute_attention_matrix
+    A = compute_attention_matrix(
+        Q=Q,
+        K=K,
+        V=V,
+        attention_mask=attention_mask,
+        is_causal=False,  # We handle causal masking in the attention implementations
+        n_groups=n_groups,
+        n_kv_heads=n_kv_heads,
+        n_heads=n_heads,
+        kv_seq_len=K.shape[-2],
+        sliding_window=getattr(self.config, "sliding_window", None),
+        softmax_scale=None,  # Will use default scaling
+    )
+    
+    attn_output = A.transpose(1, 2).reshape(bsz, q_len, n_heads*head_dim)
     attn_output = self.apply_o(self, attn_output)
     attn_weights = None
     return attn_output, attn_weights, past_key_value
@@ -336,32 +288,24 @@ def Qwen3Attention_fast_forward_inference(
         Knn, Vnn = Kn, Vn
     pass
 
-    # Grouped query attention
-    _, _, cached_len, _ = Knn.shape
-    if bsz == 1 or not SDPA_HAS_GQA and n_groups != 1:
-        Knn = Knn[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, cached_len, head_dim)
-        Vnn = Vnn[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, cached_len, head_dim)
-        Knn = Knn.reshape(bsz, n_heads, cached_len, head_dim)
-        Vnn = Vnn.reshape(bsz, n_heads, cached_len, head_dim)
-    pass
-    # else:
-    #     Knn, Vnn = Knn, Vnn
-    # pass
-
-    # Attention
-    if bsz == 1:
-        Qn *= self.scalar # See https://github.com/ggerganov/llama.cpp/issues/7805#issuecomment-2153349963
-        # It seems like doing (Q * scalar) @ K is better than (Q @ K) * scalar to stop overflows
-        A = torch_matmul(Qn, Knn.transpose(2, 3), out = self.attention[:,:,:,:cached_len])
-        # if attention_mask is not None: A += attention_mask # Must add attention_mask for batched
-        A[:] = torch_nn_functional_softmax(A, dim = -1, dtype = torch.float32)#.to(A.dtype)
-        A = torch_matmul(A, Vnn, out = Qn)
-    else:
-        if SDPA_HAS_GQA:
-            A = scaled_dot_product_attention(Qn, Knn, Vnn, attn_mask = attention_mask, is_causal = False, enable_gqa = True)
-        else:
-            A = scaled_dot_product_attention(Qn, Knn, Vnn, attn_mask = attention_mask, is_causal = False)
-    pass
+    # Use the new shared attention computation for inference
+    from ._utils_attention import compute_attention_matrix_inference
+    A = compute_attention_matrix_inference(
+        Qn=Qn,
+        Kn=Knn,
+        Vn=Vnn,
+        K1=K1,
+        V1=V1,
+        attention=self.attention,
+        scalar=self.scalar,
+        n_groups=n_groups,
+        n_kv_heads=n_kv_heads,
+        n_heads=n_heads,
+        cached_len=Knn.shape[2],  # Use Knn.shape[2] which is the actual cached length after sliding window
+        sliding_window=sliding_window,
+        attention_mask=attention_mask,
+    )
+    
     A = A.transpose(1, 2)
     A = A.reshape(bsz, 1, attention_size)
     A = fast_linear_forward(self.o_proj, A, out = self.temp_O)
