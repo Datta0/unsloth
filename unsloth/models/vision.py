@@ -76,9 +76,11 @@ PROMPT_LOOPKUP = dict()
 VLLM_SUPPORTED_VLM = [
     "qwen2_5_vl",
     "gemma3",
+    "gpt_oss"
 ]
 VLLM_NON_LORA_VLM = [
-    "mllama"
+    "mllama",
+    "gpt_oss",
 ]
 
 from transformers import GenerationConfig, CompileConfig, HybridCache, AutoConfig, PretrainedConfig
