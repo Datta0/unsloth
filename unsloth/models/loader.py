@@ -853,6 +853,26 @@ class FastModel(FastBaseModel):
                 "We must only allow one config file.\n"
                 "Please separate the LoRA and base models to 2 repos."
             )
+
+        # Fail if we see neither model config or peft config
+        if not is_model and not is_peft:
+            error = autoconfig_error if autoconfig_error is not None else peft_error
+            # Old transformers version
+            if "rope_scaling" in error.lower() and not SUPPORTS_LLAMA31:
+                raise ImportError(
+                    f"Unsloth: Your transformers version of {transformers_version} does not support new RoPE scaling methods.\n"
+                    f"This includes Llama 3.1. The minimum required version is 4.43.2\n"
+                    f'Try `pip install --upgrade "transformers>=4.43.2"`\n'
+                    f"to obtain the latest transformers build, then restart this session."
+                )
+            # Create a combined error message showing both failures
+            combined_error = (
+                "Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.\n\n"
+                f"AutoConfig error: {autoconfig_error}\n\n"
+                f"PeftConfig error: {peft_error}\n\n"
+            )
+            raise RuntimeError(combined_error)
+
         model_types = get_transformers_model_type(
             peft_config if peft_config is not None else model_config,
             trust_remote_code = trust_remote_code,
@@ -1014,24 +1034,6 @@ class FastModel(FastBaseModel):
                     >= 2
                 ):
                     both_exist = True
-
-        if not is_model and not is_peft:
-            error = autoconfig_error if autoconfig_error is not None else peft_error
-            # Old transformers version
-            if "rope_scaling" in error.lower() and not SUPPORTS_LLAMA31:
-                raise ImportError(
-                    f"Unsloth: Your transformers version of {transformers_version} does not support new RoPE scaling methods.\n"
-                    f"This includes Llama 3.1. The minimum required version is 4.43.2\n"
-                    f'Try `pip install --upgrade "transformers>=4.43.2"`\n'
-                    f"to obtain the latest transformers build, then restart this session."
-                )
-            # Create a combined error message showing both failures
-            combined_error = (
-                "Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.\n\n"
-                f"AutoConfig error: {autoconfig_error}\n\n"
-                f"PeftConfig error: {peft_error}\n\n"
-            )
-            raise RuntimeError(combined_error)
 
         # Get base model for PEFT:
         if is_peft:
