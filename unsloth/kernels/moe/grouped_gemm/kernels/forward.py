@@ -33,9 +33,11 @@ if _make_tensor_descriptor is None:
 # -----------------------------------------------------------------------------
 def _check_tl_range_flatten_support():
     try:
-        import inspect
-        sig = inspect.signature(tl.range)
-        return 'flatten' in sig.parameters
+        # Check by actually calling it.
+        # Inspect is flaky on some versions where the python signature differs from the backend capabilities
+        # or on different pytorch/triton build combinations
+        triton.language.range(1, flatten=True)
+        return True
     except Exception:
         return False
 
