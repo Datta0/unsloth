@@ -56,7 +56,7 @@ def _grouped_gemm_forward_loop_body(
     acc_dtype: tl.constexpr, output_dtype: tl.constexpr, TOTAL_TOKENS
 ):
     SHOULD_FUSE_MUL: tl.constexpr = FUSE_MUL_PRE or FUSE_MUL_POST
-    SHOULD_PERMUTE_OR_FUSE: tl.constexpr = PERMUTE_X or PERMUTE_Y or SHOULD_FUSE_MUL
+    SHOULD_PERMUTE_OR_FUSE: tl.constexpr = (PERMUTE_X or PERMUTE_Y) or SHOULD_FUSE_MUL
 
     m_block_range = tl.arange(0, BLOCK_SIZE_M)
     m_start = m_end
@@ -266,7 +266,7 @@ def _grouped_gemm_forward_kernel(
     TOTAL_TOKENS = NUM_TOKENS * TOPK
     # SHOULD_PERMUTE: tl.constexpr = PERMUTE_X or PERMUTE_Y
     # SHOULD_FUSE_MUL: tl.constexpr = FUSE_MUL_PRE or FUSE_MUL_POST
-    # SHOULD_PERMUTE_OR_FUSE: tl.constexpr = SHOULD_PERMUTE or SHOULD_FUSE_MUL
+    # SHOULD_PERMUTE_OR_FUSE: tl.constexpr = (SHOULD_PERMUTE) or (SHOULD_FUSE_MUL)
     # tl.static_print("SHOULD_PERMUTE", PERMUTE_X, PERMUTE_Y, FUSE_MUL_PRE, FUSE_MUL_POST, SHOULD_PERMUTE, SHOULD_FUSE, SHOULD_PERMUTE_OR_FUSE)
     tidx = tl.program_id(0)
     output_dtype: tl.dtype = y_ptr.dtype.element_ty
