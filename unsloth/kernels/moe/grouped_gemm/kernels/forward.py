@@ -41,7 +41,7 @@ def _check_tl_range_flatten_support():
     except Exception:
         return False
 
-TL_RANGE_FLATTEN_SUPPORTED = tl.constexpr(_check_tl_range_flatten_support())
+_TL_RANGE_FLATTEN_SUPPORTED = tl.constexpr(_check_tl_range_flatten_support())
 
 @triton.jit
 def _grouped_gemm_forward_loop_body(
@@ -53,8 +53,11 @@ def _grouped_gemm_forward_loop_body(
     # Configs
     PERMUTE_X: tl.constexpr, PERMUTE_Y: tl.constexpr, FUSE_MUL_PRE: tl.constexpr, FUSE_MUL_POST: tl.constexpr,
     USE_TMA_LOAD_W: tl.constexpr, USE_TMA_LOAD_X: tl.constexpr, USE_TMA_STORE: tl.constexpr,
-    acc_dtype: tl.constexpr, output_dtype: tl.constexpr, TOTAL_TOKENS, SHOULD_PERMUTE_OR_FUSE: tl.constexpr
+    acc_dtype: tl.constexpr, output_dtype: tl.constexpr, TOTAL_TOKENS
 ):
+    SHOULD_FUSE_MUL: tl.constexpr = FUSE_MUL_PRE or FUSE_MUL_POST
+    SHOULD_PERMUTE_OR_FUSE: tl.constexpr = PERMUTE_X or PERMUTE_Y or SHOULD_FUSE_MUL
+
     m_block_range = tl.arange(0, BLOCK_SIZE_M)
     m_start = m_end
     m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
@@ -261,9 +264,9 @@ def _grouped_gemm_forward_kernel(
     tl.static_assert(K % BLOCK_SIZE_K == 0)
 
     TOTAL_TOKENS = NUM_TOKENS * TOPK
-    SHOULD_PERMUTE: tl.constexpr = PERMUTE_X or PERMUTE_Y
-    SHOULD_FUSE_MUL: tl.constexpr = FUSE_MUL_PRE or FUSE_MUL_POST
-    SHOULD_PERMUTE_OR_FUSE: tl.constexpr = SHOULD_PERMUTE or SHOULD_FUSE_MUL
+    # SHOULD_PERMUTE: tl.constexpr = PERMUTE_X or PERMUTE_Y
+    # SHOULD_FUSE_MUL: tl.constexpr = FUSE_MUL_PRE or FUSE_MUL_POST
+    # SHOULD_PERMUTE_OR_FUSE: tl.constexpr = SHOULD_PERMUTE or SHOULD_FUSE_MUL
     # tl.static_print("SHOULD_PERMUTE", PERMUTE_X, PERMUTE_Y, FUSE_MUL_PRE, FUSE_MUL_POST, SHOULD_PERMUTE, SHOULD_FUSE, SHOULD_PERMUTE_OR_FUSE)
     tidx = tl.program_id(0)
     output_dtype: tl.dtype = y_ptr.dtype.element_ty
@@ -305,7 +308,7 @@ def _grouped_gemm_forward_kernel(
                 NUM_TOKENS, TOPK, N, K, NUM_SMS, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 PERMUTE_X, PERMUTE_Y, FUSE_MUL_PRE, FUSE_MUL_POST,
                 USE_TMA_LOAD_W, USE_TMA_LOAD_X, USE_TMA_STORE,
-                acc_dtype, output_dtype, TOTAL_TOKENS, SHOULD_PERMUTE_OR_FUSE
+                acc_dtype, output_dtype, TOTAL_TOKENS
             )
     else:
         for expert_idx in tl.range(NUM_EXPERTS):
@@ -316,7 +319,7 @@ def _grouped_gemm_forward_kernel(
                 NUM_TOKENS, TOPK, N, K, NUM_SMS, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 PERMUTE_X, PERMUTE_Y, FUSE_MUL_PRE, FUSE_MUL_POST,
                 USE_TMA_LOAD_W, USE_TMA_LOAD_X, USE_TMA_STORE,
-                acc_dtype, output_dtype, TOTAL_TOKENS, SHOULD_PERMUTE_OR_FUSE
+                acc_dtype, output_dtype, TOTAL_TOKENS
             )
 
 
