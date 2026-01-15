@@ -4,8 +4,20 @@
 import logging
 import warnings
 from dataclasses import asdict
+import os
 
 import torch
+
+# Fix for https://github.com/triton-lang/triton/issues/3820
+# and https://github.com/unslothai/unsloth/issues/160
+# This fixes the IndexError: map::at error on T4 GPUs / older Triton versions
+try:
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_capability()[0] < 8:
+            os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
+except Exception:
+    pass
+
 import triton
 
 from .kernels.backward import (
