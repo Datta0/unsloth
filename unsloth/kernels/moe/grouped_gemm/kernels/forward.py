@@ -120,173 +120,333 @@ def _grouped_gemm_forward_kernel(
     m_block_range = tl.arange(0, BLOCK_SIZE_M)
 
     if _TL_RANGE_FLATTEN_SUPPORTED:
-        expert_range = tl.range(NUM_EXPERTS, flatten = FLATTEN)
-    else:
-        expert_range = tl.range(NUM_EXPERTS)
+        for expert_idx in tl.range(NUM_EXPERTS, flatten = FLATTEN):
+            m_start = m_end
+            m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
+            m_end = m_start + m_size
 
-    for expert_idx in expert_range:
-        m_start = m_end
-        m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
-        m_end = m_start + m_size
+            if m_size > 0:
+                n_start = expert_idx * N
 
-        if m_size > 0:
-            n_start = expert_idx * N
+                num_m_tiles = tl.cdiv(m_size, BLOCK_SIZE_M)
+                num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+                num_tiles_per_expert = num_m_tiles * num_n_tiles
 
-            num_m_tiles = tl.cdiv(m_size, BLOCK_SIZE_M)
-            num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-            num_tiles_per_expert = num_m_tiles * num_n_tiles
-
-            # Need to create tma_store within loop since we need to predicate stores based on m_size
-            if USE_TMA_STORE:
-                y_desc = _make_tensor_descriptor(
-                    y_ptr,  # + m_start * N,
-                    shape = [m_end, N],
-                    strides = [N, 1],
-                    block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_N],
-                )
-
-            # Process tiles for this expert
-            while (
-                tidx >= processed_tiles
-                and tidx < processed_tiles + num_tiles_per_expert
-            ):
-                tile_idx = tidx - processed_tiles
-
-                # Check if L2 cache re-use for this order is optimal
-                tile_m_idx = tile_idx % num_m_tiles
-                tile_n_idx = tile_idx // num_m_tiles
-
-                if SHOULD_PERMUTE_OR_FUSE:
-                    # These will be used for loading and storing in permuted order
-                    gather_offsets = tile_m_idx * BLOCK_SIZE_M + m_block_range
-                    indices_to_gather = m_start + tl.max_contiguous(
-                        tl.multiple_of(gather_offsets % m_size, BLOCK_SIZE_M),
-                        BLOCK_SIZE_M,
+                # Need to create tma_store within loop since we need to predicate stores based on m_size
+                if USE_TMA_STORE:
+                    y_desc = _make_tensor_descriptor(
+                        y_ptr,  # + m_start * N,
+                        shape = [m_end, N],
+                        strides = [N, 1],
+                        block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_N],
                     )
-                    expert_token_idx = tl.load(
-                        gather_indices_ptr + indices_to_gather,
-                        mask = indices_to_gather < TOTAL_TOKENS,
-                    )
-                    expert_token_offsets = expert_token_idx[:, None]
 
-                    # Masks for permuted load and store
+                # Process tiles for this expert
+                while (
+                    tidx >= processed_tiles
+                    and tidx < processed_tiles + num_tiles_per_expert
+                ):
+                    tile_idx = tidx - processed_tiles
 
-                    row_mask = gather_offsets < m_size
-                    row_mask = row_mask[:, None]
+                    # Check if L2 cache re-use for this order is optimal
+                    tile_m_idx = tile_idx % num_m_tiles
+                    tile_n_idx = tile_idx // num_m_tiles
 
-                    # row_mask = indices_to_gather < m_end
-                    # row_mask = row_mask[:, None]
+                    if SHOULD_PERMUTE_OR_FUSE:
+                        # These will be used for loading and storing in permuted order
+                        gather_offsets = tile_m_idx * BLOCK_SIZE_M + m_block_range
+                        indices_to_gather = m_start + tl.max_contiguous(
+                            tl.multiple_of(gather_offsets % m_size, BLOCK_SIZE_M),
+                            BLOCK_SIZE_M,
+                        )
+                        expert_token_idx = tl.load(
+                            gather_indices_ptr + indices_to_gather,
+                            mask = indices_to_gather < TOTAL_TOKENS,
+                        )
+                        expert_token_offsets = expert_token_idx[:, None]
 
-                # We only take into account the following two cases: (PERMUTE_X and NOT PERMUTE_Y) and (NOT PERMUTE_X and PERMUTE_Y)
-                # Hence, we can make the following simplifying assumptions when loading and storing
-                # Note the different strides between the two cases: the offsets for loading and storing are flipped and the strides must also be adjusted
-                if PERMUTE_X:
-                    load_idx = (
-                        (expert_token_offsets // TOPK) * K
-                    )  # Permute on load from token -> expert order, divide by TOPK to index from original number of tokens
-                    store_idx = (
-                        indices_to_gather[:, None] * N
-                    )  # Store in contiguous order
-                else:
-                    off_am = tile_m_idx * BLOCK_SIZE_M
-                    if not PERMUTE_Y:
-                        # These will already be computed if permuting y
-                        offs_am = off_am + m_block_range
-                        row_mask = offs_am[:, None] < m_size
-                        row_idx = m_start + offs_am[:, None]
-                        store_idx = row_idx * N
-                        if not USE_TMA_LOAD_X:
-                            load_idx = row_idx * K
+                        # Masks for permuted load and store
 
-                if PERMUTE_Y:
-                    if not USE_TMA_LOAD_X:
+                        row_mask = gather_offsets < m_size
+                        row_mask = row_mask[:, None]
+
+                        # row_mask = indices_to_gather < m_end
+                        # row_mask = row_mask[:, None]
+
+                    # We only take into account the following two cases: (PERMUTE_X and NOT PERMUTE_Y) and (NOT PERMUTE_X and PERMUTE_Y)
+                    # Hence, we can make the following simplifying assumptions when loading and storing
+                    # Note the different strides between the two cases: the offsets for loading and storing are flipped and the strides must also be adjusted
+                    if PERMUTE_X:
                         load_idx = (
-                            indices_to_gather[:, None] * K
-                        )  # Load in contiguous order (no permutation on load)
-                    # offs_am = off_am + m_block_range
-                    # row_mask = offs_am[:, None] < m_size
-                    store_idx = (
-                        expert_token_offsets * N
-                    )  # Permute on store from expert -> token order
-
-                # We always load topk weights in expert order
-                # In the pre-multiplication case, we multiply permuted hidden states by weights before the first gemm
-                # In the post-multiplication case, we multiply permuted hidden states by weights after the second gemm
-                # In either case, the hidden states are grouped by expert, so we always permute on load of topk weights
-                if SHOULD_FUSE_MUL:
-                    topk_load_idx = expert_token_offsets
-
-                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype = acc_dtype)
-
-                offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-                if not USE_TMA_LOAD_X:
-                    x_ptrs = x_ptr + load_idx + offs_k[None, :]
-
-                if not USE_TMA_LOAD_W:
-                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-                    offs_bn = tl.max_contiguous(
-                        tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N
-                    )
-                    w_ptrs = w_ptr + (n_start + offs_bn[:, None]) * K + offs_k[None, :]
-
-                for k_offset in range(0, K, BLOCK_SIZE_K):
-                    if not USE_TMA_LOAD_X:
-                        x = tl.load(x_ptrs, mask = row_mask)
+                            (expert_token_offsets // TOPK) * K
+                        )  # Permute on load from token -> expert order, divide by TOPK to index from original number of tokens
+                        store_idx = (
+                            indices_to_gather[:, None] * N
+                        )  # Store in contiguous order
                     else:
-                        x = x_desc.load([m_start + off_am, k_offset])
+                        off_am = tile_m_idx * BLOCK_SIZE_M
+                        if not PERMUTE_Y:
+                            # These will already be computed if permuting y
+                            offs_am = off_am + m_block_range
+                            row_mask = offs_am[:, None] < m_size
+                            row_idx = m_start + offs_am[:, None]
+                            store_idx = row_idx * N
+                            if not USE_TMA_LOAD_X:
+                                load_idx = row_idx * K
 
-                    if FUSE_MUL_PRE:
+                    if PERMUTE_Y:
+                        if not USE_TMA_LOAD_X:
+                            load_idx = (
+                                indices_to_gather[:, None] * K
+                            )  # Load in contiguous order (no permutation on load)
+                        # offs_am = off_am + m_block_range
+                        # row_mask = offs_am[:, None] < m_size
+                        store_idx = (
+                            expert_token_offsets * N
+                        )  # Permute on store from expert -> token order
+
+                    # We always load topk weights in expert order
+                    # In the pre-multiplication case, we multiply permuted hidden states by weights before the first gemm
+                    # In the post-multiplication case, we multiply permuted hidden states by weights after the second gemm
+                    # In either case, the hidden states are grouped by expert, so we always permute on load of topk weights
+                    if SHOULD_FUSE_MUL:
+                        topk_load_idx = expert_token_offsets
+
+                    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype = acc_dtype)
+
+                    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+                    if not USE_TMA_LOAD_X:
+                        x_ptrs = x_ptr + load_idx + offs_k[None, :]
+
+                    if not USE_TMA_LOAD_W:
+                        offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                        offs_bn = tl.max_contiguous(
+                            tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N
+                        )
+                        w_ptrs = w_ptr + (n_start + offs_bn[:, None]) * K + offs_k[None, :]
+
+                    for k_offset in range(0, K, BLOCK_SIZE_K):
+                        if not USE_TMA_LOAD_X:
+                            x = tl.load(x_ptrs, mask = row_mask)
+                        else:
+                            x = x_desc.load([m_start + off_am, k_offset])
+
+                        if FUSE_MUL_PRE:
+                            # Check for correct broadcasting
+                            topk_weights = tl.load(
+                                topk_weights_ptr + topk_load_idx, mask = row_mask
+                            )
+                            x *= topk_weights.to(x.dtype)
+
+                        if not USE_TMA_LOAD_W:
+                            w = tl.load(w_ptrs, mask = offs_bn[:, None] < N)
+                        else:
+                            w = w_desc.load(
+                                [expert_idx, tile_n_idx * BLOCK_SIZE_N, k_offset]
+                            )
+                            w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
+
+                        x = x.to(w.dtype)
+                        accumulator += tl.dot(x, w.T)
+
+                        if not USE_TMA_LOAD_X:
+                            x_ptrs += BLOCK_SIZE_K
+
+                        if not USE_TMA_LOAD_W:
+                            w_ptrs += BLOCK_SIZE_K
+
+                    y = accumulator.to(output_dtype)
+
+                    # NOTE: order of fusing multiplication is important
+                    # Fusing before accumulator dtype conversion results in numerical diffs
+                    if FUSE_MUL_POST:
                         # Check for correct broadcasting
                         topk_weights = tl.load(
                             topk_weights_ptr + topk_load_idx, mask = row_mask
                         )
-                        x *= topk_weights.to(x.dtype)
+                        y *= topk_weights.to(output_dtype)
 
-                    if not USE_TMA_LOAD_W:
-                        w = tl.load(w_ptrs, mask = offs_bn[:, None] < N)
+                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                    store_mask = row_mask & (offs_bn[None, :] < N)
+
+                    if USE_TMA_STORE:
+                        offset_m = tile_m_idx * BLOCK_SIZE_M  # .to(tl.int32)
+                        offset_n = tile_n_idx * BLOCK_SIZE_N  # .to(tl.int32)
+                        y_desc.store([m_start + offset_m, offset_n], y)
                     else:
-                        w = w_desc.load(
-                            [expert_idx, tile_n_idx * BLOCK_SIZE_N, k_offset]
+                        tl.store(
+                            y_ptr + store_idx + offs_bn[None, :],
+                            y,
+                            mask = store_mask,
                         )
-                        w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
+                    tidx += NUM_SMS
 
-                    x = x.to(w.dtype)
-                    accumulator += tl.dot(x, w.T)
+                processed_tiles += num_tiles_per_expert
+    else:
+        for expert_idx in tl.range(NUM_EXPERTS):
+            m_start = m_end
+            m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
+            m_end = m_start + m_size
+
+            if m_size > 0:
+                n_start = expert_idx * N
+
+                num_m_tiles = tl.cdiv(m_size, BLOCK_SIZE_M)
+                num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+                num_tiles_per_expert = num_m_tiles * num_n_tiles
+
+                # Need to create tma_store within loop since we need to predicate stores based on m_size
+                if USE_TMA_STORE:
+                    y_desc = _make_tensor_descriptor(
+                        y_ptr,  # + m_start * N,
+                        shape = [m_end, N],
+                        strides = [N, 1],
+                        block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_N],
+                    )
+
+                # Process tiles for this expert
+                while (
+                    tidx >= processed_tiles
+                    and tidx < processed_tiles + num_tiles_per_expert
+                ):
+                    tile_idx = tidx - processed_tiles
+
+                    # Check if L2 cache re-use for this order is optimal
+                    tile_m_idx = tile_idx % num_m_tiles
+                    tile_n_idx = tile_idx // num_m_tiles
+
+                    if SHOULD_PERMUTE_OR_FUSE:
+                        # These will be used for loading and storing in permuted order
+                        gather_offsets = tile_m_idx * BLOCK_SIZE_M + m_block_range
+                        indices_to_gather = m_start + tl.max_contiguous(
+                            tl.multiple_of(gather_offsets % m_size, BLOCK_SIZE_M),
+                            BLOCK_SIZE_M,
+                        )
+                        expert_token_idx = tl.load(
+                            gather_indices_ptr + indices_to_gather,
+                            mask = indices_to_gather < TOTAL_TOKENS,
+                        )
+                        expert_token_offsets = expert_token_idx[:, None]
+
+                        # Masks for permuted load and store
+
+                        row_mask = gather_offsets < m_size
+                        row_mask = row_mask[:, None]
+
+                        # row_mask = indices_to_gather < m_end
+                        # row_mask = row_mask[:, None]
+
+                    # We only take into account the following two cases: (PERMUTE_X and NOT PERMUTE_Y) and (NOT PERMUTE_X and PERMUTE_Y)
+                    # Hence, we can make the following simplifying assumptions when loading and storing
+                    # Note the different strides between the two cases: the offsets for loading and storing are flipped and the strides must also be adjusted
+                    if PERMUTE_X:
+                        load_idx = (
+                            (expert_token_offsets // TOPK) * K
+                        )  # Permute on load from token -> expert order, divide by TOPK to index from original number of tokens
+                        store_idx = (
+                            indices_to_gather[:, None] * N
+                        )  # Store in contiguous order
+                    else:
+                        off_am = tile_m_idx * BLOCK_SIZE_M
+                        if not PERMUTE_Y:
+                            # These will already be computed if permuting y
+                            offs_am = off_am + m_block_range
+                            row_mask = offs_am[:, None] < m_size
+                            row_idx = m_start + offs_am[:, None]
+                            store_idx = row_idx * N
+                            if not USE_TMA_LOAD_X:
+                                load_idx = row_idx * K
+
+                    if PERMUTE_Y:
+                        if not USE_TMA_LOAD_X:
+                            load_idx = (
+                                indices_to_gather[:, None] * K
+                            )  # Load in contiguous order (no permutation on load)
+                        # offs_am = off_am + m_block_range
+                        # row_mask = offs_am[:, None] < m_size
+                        store_idx = (
+                            expert_token_offsets * N
+                        )  # Permute on store from expert -> token order
+
+                    # We always load topk weights in expert order
+                    # In the pre-multiplication case, we multiply permuted hidden states by weights before the first gemm
+                    # In the post-multiplication case, we multiply permuted hidden states by weights after the second gemm
+                    # In either case, the hidden states are grouped by expert, so we always permute on load of topk weights
+                    if SHOULD_FUSE_MUL:
+                        topk_load_idx = expert_token_offsets
+
+                    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype = acc_dtype)
+
+                    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
                     if not USE_TMA_LOAD_X:
-                        x_ptrs += BLOCK_SIZE_K
+                        x_ptrs = x_ptr + load_idx + offs_k[None, :]
 
                     if not USE_TMA_LOAD_W:
-                        w_ptrs += BLOCK_SIZE_K
+                        offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                        offs_bn = tl.max_contiguous(
+                            tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N
+                        )
+                        w_ptrs = w_ptr + (n_start + offs_bn[:, None]) * K + offs_k[None, :]
 
-                y = accumulator.to(output_dtype)
+                    for k_offset in range(0, K, BLOCK_SIZE_K):
+                        if not USE_TMA_LOAD_X:
+                            x = tl.load(x_ptrs, mask = row_mask)
+                        else:
+                            x = x_desc.load([m_start + off_am, k_offset])
 
-                # NOTE: order of fusing multiplication is important
-                # Fusing before accumulator dtype conversion results in numerical diffs
-                if FUSE_MUL_POST:
-                    # Check for correct broadcasting
-                    topk_weights = tl.load(
-                        topk_weights_ptr + topk_load_idx, mask = row_mask
-                    )
-                    y *= topk_weights.to(output_dtype)
+                        if FUSE_MUL_PRE:
+                            # Check for correct broadcasting
+                            topk_weights = tl.load(
+                                topk_weights_ptr + topk_load_idx, mask = row_mask
+                            )
+                            x *= topk_weights.to(x.dtype)
 
-                offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-                store_mask = row_mask & (offs_bn[None, :] < N)
+                        if not USE_TMA_LOAD_W:
+                            w = tl.load(w_ptrs, mask = offs_bn[:, None] < N)
+                        else:
+                            w = w_desc.load(
+                                [expert_idx, tile_n_idx * BLOCK_SIZE_N, k_offset]
+                            )
+                            w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
 
-                if USE_TMA_STORE:
-                    offset_m = tile_m_idx * BLOCK_SIZE_M  # .to(tl.int32)
-                    offset_n = tile_n_idx * BLOCK_SIZE_N  # .to(tl.int32)
-                    y_desc.store([m_start + offset_m, offset_n], y)
-                else:
-                    tl.store(
-                        y_ptr + store_idx + offs_bn[None, :],
-                        y,
-                        mask = store_mask,
-                    )
-                tidx += NUM_SMS
+                        x = x.to(w.dtype)
+                        accumulator += tl.dot(x, w.T)
 
-            processed_tiles += num_tiles_per_expert
+                        if not USE_TMA_LOAD_X:
+                            x_ptrs += BLOCK_SIZE_K
+
+                        if not USE_TMA_LOAD_W:
+                            w_ptrs += BLOCK_SIZE_K
+
+                    y = accumulator.to(output_dtype)
+
+                    # NOTE: order of fusing multiplication is important
+                    # Fusing before accumulator dtype conversion results in numerical diffs
+                    if FUSE_MUL_POST:
+                        # Check for correct broadcasting
+                        topk_weights = tl.load(
+                            topk_weights_ptr + topk_load_idx, mask = row_mask
+                        )
+                        y *= topk_weights.to(output_dtype)
+
+                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                    store_mask = row_mask & (offs_bn[None, :] < N)
+
+                    if USE_TMA_STORE:
+                        offset_m = tile_m_idx * BLOCK_SIZE_M  # .to(tl.int32)
+                        offset_n = tile_n_idx * BLOCK_SIZE_N  # .to(tl.int32)
+                        y_desc.store([m_start + offset_m, offset_n], y)
+                    else:
+                        tl.store(
+                            y_ptr + store_idx + offs_bn[None, :],
+                            y,
+                            mask = store_mask,
+                        )
+                    tidx += NUM_SMS
+
+                processed_tiles += num_tiles_per_expert
 
 
 _autotuned_grouped_gemm_forward_kernel = triton.autotune(
