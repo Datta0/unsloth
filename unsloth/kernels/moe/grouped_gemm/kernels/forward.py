@@ -41,7 +41,7 @@ def _check_tl_range_flatten_support():
     except Exception:
         return False
 
-_TL_RANGE_FLATTEN_SUPPORTED = _check_tl_range_flatten_support()
+_TL_RANGE_FLATTEN_SUPPORTED = tl.constexpr(_check_tl_range_flatten_support())
 
 
 #
