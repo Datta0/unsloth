@@ -763,6 +763,7 @@ for model_name in model_architectures:
     config_filename = f"{model_name.title().replace('_','')}Config"  # qwen3 arch folder is qwen3_moe but config is Qwen3Config. Need to remove underscore(_) for now
     try:
         exec(f"from {config_filepath} import {config_filename}", globals())
+        exec(f"from transformers.utils import auto_docstring, logging", globals())
     except:
         continue
 
