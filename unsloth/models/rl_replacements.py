@@ -262,15 +262,23 @@ def grpo_trainer__generate_single_turn(function_name, function):
     if function_name != "_generate_single_turn":
         return function
 
-    # Remove the reload_weights collective RPC call from the generate function's source
-    # function = function.replace('self.llm.collective_rpc("reload_weights")', "")
-    # The regex below does the same thing but is more flexible and can handle single or double quotes
-    # This is for older versions.
-    function = re.sub(
-        r"self\.llm\.collective_rpc\(\s*(['\"])reload_weights\1\s*\)",
-        "",
-        function,
+    # Older TRL versions may directly reload vLLM weights here. Only skip that
+    # when the attached engine explicitly advertises shared weights.
+    reload_weights_pattern = re.compile(
+        r"^(?P<indent>[ \t]*)self\.llm\.collective_rpc\(\s*(['\"])reload_weights\2\s*\)\s*$",
+        re.MULTILINE,
     )
+
+    def replace_reload_weights_line(match):
+        indent = match.group("indent")
+        return (
+            f"{indent}if not getattr(self.llm, 'shared_weights', False):\n"
+            f'{indent}    self.llm.collective_rpc("reload_weights")\n'
+            f"{indent}else:\n"
+            f'{indent}    pass  # self.llm.collective_rpc("reload_weights")\n'
+        )
+
+    function = reload_weights_pattern.sub(replace_reload_weights_line, function)
 
     # Current TRL versions call vllm_generation.sync_weights() every step.
     # When Unsloth fast inference LoRA is active, weights are already shared.
@@ -1323,7 +1331,8 @@ RL_METRICS_CHANGES["grpo_trainer"].append(grpo_trainer_metrics)
 
 def openenv_vllm_reload_weights():
     # This function patches the trl openenv generate_rollout_completions function to:
-    # 1. Remove the reload_weights call (unsloth handles weight reloading)
+    # 1. Gate the reload_weights call on whether the attached vLLM engine
+    #    explicitly advertises shared weights with the HF model.
     # 2. Fix wake_up call to be compatible with unsloth (remove tags to wake everything)
     #
     # The issue: TRL's wake_up(tags=["kv_cache"]) only wakes kv_cache, leaving is_sleeping=True
@@ -1360,8 +1369,21 @@ def openenv_vllm_reload_weights():
     src = textwrap.dedent(src)
     original_src = src
 
-    # Remove the reload_weights call - unsloth handles this differently
-    src = re.sub(r'.*\.collective_rpc\(\s*([\'"])reload_weights\1\s*\).*\n?', "", src)
+    reload_weights_pattern = re.compile(
+        r"^(?P<indent>[ \t]*)trainer\.vllm_generation\.llm\.collective_rpc\(\s*(['\"])reload_weights\2\s*\)\s*$",
+        re.MULTILINE,
+    )
+
+    def replace_reload_weights(match):
+        indent = match.group("indent")
+        return (
+            f"{indent}if not getattr(trainer.vllm_generation.llm, 'shared_weights', False):\n"
+            f'{indent}    trainer.vllm_generation.llm.collective_rpc("reload_weights")\n'
+            f"{indent}else:\n"
+            f'{indent}    pass  # trainer.vllm_generation.llm.collective_rpc("reload_weights")\n'
+        )
+
+    src = reload_weights_pattern.sub(replace_reload_weights, src)
 
     # Change wake_up(tags=["kv_cache"]) to wake_up() - wake everything to set is_sleeping=False
     # This prevents double wake_up issues. Unsloth's allocator skips weights anyway.
