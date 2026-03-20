@@ -371,7 +371,7 @@ export function useChatModelRuntime() {
               previousWasUnloaded = true;
             }
 
-            const { chatTemplateOverride, kvCacheDtype } = useChatRuntimeStore.getState();
+            const { chatTemplateOverride, kvCacheDtype, inferenceGpuIds } = useChatRuntimeStore.getState();
             const loadResponse = await loadModel({
               model_path: modelId,
               hf_token: null,
@@ -382,6 +382,7 @@ export function useChatModelRuntime() {
               trust_remote_code: paramsBeforeLoad.trustRemoteCode ?? false,
               chat_template_override: chatTemplateOverride,
               cache_type_kv: kvCacheDtype,
+              gpu_ids: inferenceGpuIds,
             });
 
             // If cancelled while loading, don't update UI to show

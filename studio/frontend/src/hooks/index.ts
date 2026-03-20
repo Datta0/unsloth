@@ -4,6 +4,8 @@
 export { useDebouncedValue } from "./use-debounced-value";
 export { useGpuInfo } from "./use-gpu-info";
 export { useGpuUtilization } from "./use-gpu-utilization";
+export { useGpuVisibility } from "./use-gpu-visibility";
+export type { GpuDevice, GpuVisibility } from "./use-gpu-visibility";
 export { useHardwareInfo } from "./use-hardware-info";
 export { useHfModelSearch } from "./use-hf-model-search";
 export { useRecommendedModelVram } from "./use-recommended-model-vram";

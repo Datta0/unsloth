@@ -81,6 +81,7 @@ export interface TrainingConfigState {
   finetuneMLPModules: boolean;
   targetModules: string[];
   maxPositionEmbeddings: number | null;
+  selectedGpuIds: number[] | null;
 }
 
 export interface TrainingConfigActions {
@@ -143,6 +144,7 @@ export interface TrainingConfigActions {
   setFinetuneAttentionModules: (value: boolean) => void;
   setFinetuneMLPModules: (value: boolean) => void;
   setTargetModules: (value: string[]) => void;
+  setSelectedGpuIds: (value: number[] | null) => void;
   canProceed: () => boolean;
   reset: () => void;
   resetToModelDefaults: () => void;

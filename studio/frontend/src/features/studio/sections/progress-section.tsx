@@ -26,7 +26,7 @@ import {
   useTrainingConfigStore,
   useTrainingRuntimeStore,
 } from "@/features/training";
-import { useGpuUtilization } from "@/hooks";
+import { useGpuUtilization, useGpuVisibility } from "@/hooks";
 import { cn } from "@/lib/utils";
 import {
   ChartAverageIcon,
@@ -103,8 +103,11 @@ export function ProgressSection(): ReactElement {
     })),
   );
 
+  const selectedGpuIds = useTrainingConfigStore((s) => s.selectedGpuIds);
+
   const { stopTrainingRun } = useTrainingActions();
   const gpu = useGpuUtilization(runtime.isTrainingRunning);
+  const gpuVisibility = useGpuVisibility();
   const [stopDialogOpen, setStopDialogOpen] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
 
@@ -291,11 +294,32 @@ export function ProgressSection(): ReactElement {
         </div>
 
         <div className="flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <p className="text-xs font-medium text-muted-foreground">
-              GPU Monitor
-            </p>
-            <span className="text-[11px] text-muted-foreground">Live</span>
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-medium text-muted-foreground">
+                GPU Monitor
+              </p>
+              <span className="text-[11px] text-muted-foreground">Live</span>
+            </div>
+            {gpuVisibility.devices.length > 1 && (
+              <div className="flex flex-wrap gap-1">
+                {gpuVisibility.devices.map((device) => {
+                  const active = selectedGpuIds === null || selectedGpuIds.includes(device.index);
+                  return (
+                    <span
+                      key={device.index}
+                      className={`rounded-md px-1.5 py-0.5 text-[10px] tabular-nums ${
+                        active
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400"
+                          : "bg-muted/50 text-muted-foreground/50"
+                      }`}
+                    >
+                      GPU {device.index}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
           </div>
           <div className="grid grid-cols-2 gap-2.5">
             <GpuStat

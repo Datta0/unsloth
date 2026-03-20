@@ -5,6 +5,7 @@ import { SectionCard } from "@/components/section-card";
 import { Button } from "@/components/ui/button";
 import { ChartContainer } from "@/components/ui/chart";
 import type { ChartConfig } from "@/components/ui/chart";
+import { Switch } from "@/components/ui/switch";
 import {
   Tooltip,
   TooltipContent,
@@ -17,6 +18,7 @@ import {
   useTrainingConfigStore,
   validateTrainingConfig,
 } from "@/features/training";
+import { useGpuVisibility } from "@/hooks";
 import {
   Archive04Icon,
   ChartAverageIcon,
@@ -50,6 +52,9 @@ export function TrainingSection() {
     (!store.isAudioModel && store.isDatasetAudio === true);
   const configValidation = validateTrainingConfig(store);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const gpuVisibility = useGpuVisibility();
+  const isMultiGpu = gpuVisibility.devices.length > 1;
+  const isAutoGpu = store.selectedGpuIds === null;
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -97,6 +102,30 @@ export function TrainingSection() {
     toast.success("Parameters reset to model defaults");
   };
 
+  const toggleGpuId = (gpuIndex: number) => {
+    const currentIds = store.selectedGpuIds;
+    if (currentIds === null) return;
+    const isSelected = currentIds.includes(gpuIndex);
+    if (isSelected) {
+      // Don't allow deselecting the last GPU
+      if (currentIds.length <= 1) return;
+      store.setSelectedGpuIds(currentIds.filter((id) => id !== gpuIndex));
+    } else {
+      store.setSelectedGpuIds([...currentIds, gpuIndex].sort((a, b) => a - b));
+    }
+  };
+
+  const handleAutoToggle = (auto: boolean) => {
+    if (auto) {
+      store.setSelectedGpuIds(null);
+    } else {
+      // Switch to manual — pre-select all visible GPUs
+      store.setSelectedGpuIds(
+        gpuVisibility.devices.map((d) => d.index),
+      );
+    }
+  };
+
   return (
     <div data-tour="studio-training" className="col-span-1 xl:col-span-4">
       <SectionCard
@@ -106,12 +135,12 @@ export function TrainingSection() {
         accent="blue"
         className="md:min-h-[470px]"
       >
-        <div className="flex flex-col gap-4">
+        <div className={`flex flex-col ${isMultiGpu ? "gap-3" : "gap-4"}`}>
         {/* Loss chart */}
-        <div className="relative  ">
+        <div className="relative">
           <ChartContainer
             config={chartConfig}
-            className="h-[180px] w-full relative right-8 blur"
+            className={`${isMultiGpu ? "h-[140px]" : "h-[180px]"} w-full relative right-8 blur`}
           >
             <LineChart data={placeholderData} accessibilityLayer={true}>
               <CartesianGrid vertical={false} strokeDasharray="3 3" />
@@ -151,6 +180,49 @@ export function TrainingSection() {
           </div>
         </div>
 
+        {/* GPU Selection — only shown when multiple GPUs detected */}
+        {isMultiGpu && (
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">
+                GPUs
+              </span>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <span className="text-[10px] text-muted-foreground">Auto</span>
+                <Switch
+                  size="sm"
+                  checked={isAutoGpu}
+                  onCheckedChange={handleAutoToggle}
+                />
+              </label>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {gpuVisibility.devices.map((gpu) => {
+                const selected = isAutoGpu || (store.selectedGpuIds?.includes(gpu.index) ?? false);
+                const shortName = gpu.name.replace(/NVIDIA\s*/i, "");
+                return (
+                  <button
+                    key={gpu.index}
+                    type="button"
+                    disabled={isAutoGpu}
+                    onClick={() => toggleGpuId(gpu.index)}
+                    className={`rounded-lg border px-2 py-0.5 text-[10px] transition-colors ${
+                      isAutoGpu
+                        ? "border-border/50 bg-muted/30 text-muted-foreground/50 cursor-default"
+                        : selected
+                          ? "cursor-pointer border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-700 dark:bg-blue-950 dark:text-blue-300"
+                          : "cursor-pointer border-border text-muted-foreground hover:bg-muted/50"
+                    }`}
+                  >
+                    <span className="font-medium">{gpu.index}</span>
+                    <span className="opacity-60"> {shortName} · {gpu.memory_total_gb}GB</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Start/Stop */}
         <Button
           data-tour="studio-start"
@@ -173,53 +245,55 @@ export function TrainingSection() {
           <p className="text-xs text-red-500 leading-relaxed">{configValidation.message}</p>
         )}
 
-        {/* Upload / Save / Reset */}
-        <p className="text-xs text-muted-foreground">Training Config</p>
-        <div className="grid grid-cols-3 gap-2">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="outline"
-                size="sm"
-                className="cursor-pointer"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <HugeiconsIcon icon={CloudUploadIcon} className="size-3.5" />
-                Upload
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Load a saved YAML config</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                data-tour="studio-save"
-                variant="outline"
-                size="sm"
-                className="cursor-pointer"
-                onClick={handleSaveConfig}
-              >
-                <HugeiconsIcon icon={Archive04Icon} className="size-3.5" />
-                Save
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Download current config as YAML</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="outline"
-                size="sm"
-                className="cursor-pointer"
-                onClick={handleResetConfig}
-                disabled={!store.selectedModel}
-              >
-                <HugeiconsIcon icon={CleanIcon} className="size-3.5" />
-                Reset
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Reset to model defaults</TooltipContent>
-          </Tooltip>
+        {/* Upload / Save / Reset — compact */}
+        <div className="flex flex-col gap-1">
+          <p className="text-xs text-muted-foreground">Training Config</p>
+          <div className="grid grid-cols-3 gap-2">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="cursor-pointer"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <HugeiconsIcon icon={CloudUploadIcon} className="size-3.5" />
+                  Upload
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Load a saved YAML config</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  data-tour="studio-save"
+                  variant="outline"
+                  size="sm"
+                  className="cursor-pointer"
+                  onClick={handleSaveConfig}
+                >
+                  <HugeiconsIcon icon={Archive04Icon} className="size-3.5" />
+                  Save
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Download current config as YAML</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="cursor-pointer"
+                  onClick={handleResetConfig}
+                  disabled={!store.selectedModel}
+                >
+                  <HugeiconsIcon icon={CleanIcon} className="size-3.5" />
+                  Reset
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Reset to model defaults</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
         <input
           ref={fileInputRef}

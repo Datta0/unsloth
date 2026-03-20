@@ -79,6 +79,7 @@ type ChatRuntimeStore = {
   maxToolCallsPerMessage: number;
   toolCallTimeout: number;
   kvCacheDtype: string | null;
+  inferenceGpuIds: number[] | null;
   defaultChatTemplate: string | null;
   chatTemplateOverride: string | null;
   activeThreadId: string | null;
@@ -104,6 +105,7 @@ type ChatRuntimeStore = {
   setMaxToolCallsPerMessage: (value: number) => void;
   setToolCallTimeout: (value: number) => void;
   setKvCacheDtype: (dtype: string | null) => void;
+  setInferenceGpuIds: (ids: number[] | null) => void;
   setChatTemplateOverride: (template: string | null) => void;
   setPendingAudio: (base64: string, name: string) => void;
   clearPendingAudio: () => void;
@@ -129,6 +131,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   maxToolCallsPerMessage: loadInt(MAX_TOOL_CALLS_KEY, 10),
   toolCallTimeout: loadInt(TOOL_CALL_TIMEOUT_KEY, 5),
   kvCacheDtype: null,
+  inferenceGpuIds: null,
   defaultChatTemplate: null,
   chatTemplateOverride: null,
   activeThreadId: null,
@@ -203,6 +206,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       return { toolCallTimeout };
     }),
   setKvCacheDtype: (kvCacheDtype) => set({ kvCacheDtype }),
+  setInferenceGpuIds: (inferenceGpuIds) => set({ inferenceGpuIds }),
   setChatTemplateOverride: (chatTemplateOverride) => set({ chatTemplateOverride }),
   setPendingAudio: (base64, name) =>
     set({ pendingAudioBase64: base64, pendingAudioName: name }),

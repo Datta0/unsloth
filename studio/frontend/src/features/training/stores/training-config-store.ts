@@ -85,6 +85,7 @@ const initialState: TrainingConfigState = {
   isDatasetImage: null,
   isDatasetAudio: false,
   maxPositionEmbeddings: null,
+  selectedGpuIds: null,
   ...DEFAULT_HYPERPARAMS,
 };
 
@@ -547,6 +548,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
         setFinetuneMLPModules: (finetuneMLPModules) =>
           set({ finetuneMLPModules }),
         setTargetModules: (targetModules) => set({ targetModules }),
+        setSelectedGpuIds: (selectedGpuIds) => set({ selectedGpuIds }),
         canProceed: () => canProceedForStep(get()),
         reset: () => set(initialState),
         resetToModelDefaults: () => {
@@ -563,7 +565,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
     },
     {
       name: "unsloth_training_config_v1",
-      version: 8,
+      version: 9,
       migrate: (persisted, version) => {
         const s = persisted as Record<string, unknown>;
         if (version < 2 && s.datasetSubset == null && s.datasetConfig != null) {
@@ -592,6 +594,9 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
           s.datasetAssistantTemplate ??= "";
           s.datasetLabelMapping ??= {};
           s.datasetAdvisorNotification ??= null;
+        }
+        if (version < 9) {
+          s.selectedGpuIds ??= null;
         }
         return s as unknown as TrainingConfigStore;
       },

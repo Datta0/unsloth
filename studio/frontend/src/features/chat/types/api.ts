@@ -41,6 +41,7 @@ export interface LoadModelRequest {
   trust_remote_code?: boolean;
   chat_template_override?: string | null;
   cache_type_kv?: string | null;
+  gpu_ids?: number[] | null;
 }
 
 export interface ValidateModelResponse {

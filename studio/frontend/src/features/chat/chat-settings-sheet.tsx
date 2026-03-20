@@ -29,6 +29,7 @@ import {
 } from "./types/runtime";
 import { useChatRuntimeStore } from "./stores/chat-runtime-store";
 import { Switch } from "@/components/ui/switch";
+import { useGpuVisibility } from "@/hooks";
 
 export const defaultInferenceParams = DEFAULT_INFERENCE_PARAMS;
 export type { InferenceParams } from "./types/runtime";
@@ -426,6 +427,7 @@ export function ChatSettingsPanel({
                   </Select>
                 </div>
               )}
+              <InferenceGpuSelector onReloadModel={onReloadModel} />
               <AutoHealToolCallsToggle />
               <MaxToolCallsSlider />
               <ToolCallTimeoutSlider />
@@ -554,5 +556,84 @@ function ChatTemplateSection({
         </div>
       </div>
     </CollapsibleSection>
+  );
+}
+
+function InferenceGpuSelector({
+  onReloadModel,
+}: {
+  onReloadModel?: () => void;
+}) {
+  const gpuVisibility = useGpuVisibility();
+  const gpuIds = useChatRuntimeStore((s) => s.inferenceGpuIds);
+  const setGpuIds = useChatRuntimeStore((s) => s.setInferenceGpuIds);
+  const isAuto = gpuIds === null;
+
+  if (gpuVisibility.devices.length <= 1) return null;
+
+  const toggleGpu = (index: number) => {
+    if (gpuIds === null) return;
+    const selected = gpuIds.includes(index);
+    if (selected) {
+      if (gpuIds.length <= 1) return;
+      setGpuIds(gpuIds.filter((id) => id !== index));
+    } else {
+      setGpuIds([...gpuIds, index].sort((a, b) => a - b));
+    }
+    onReloadModel?.();
+  };
+
+  const handleAutoToggle = (auto: boolean) => {
+    if (auto) {
+      setGpuIds(null);
+    } else {
+      setGpuIds(gpuVisibility.devices.map((d) => d.index));
+    }
+    onReloadModel?.();
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-medium">GPUs</div>
+          <div className="text-[11px] text-muted-foreground">
+            Select GPUs for model loading. Reload to apply.
+          </div>
+        </div>
+        <label className="flex items-center gap-1.5 cursor-pointer shrink-0">
+          <span className="text-[10px] text-muted-foreground">Auto</span>
+          <Switch
+            size="sm"
+            checked={isAuto}
+            onCheckedChange={handleAutoToggle}
+          />
+        </label>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {gpuVisibility.devices.map((gpu) => {
+          const selected = isAuto || (gpuIds?.includes(gpu.index) ?? false);
+          const shortName = gpu.name.replace(/NVIDIA\s*/i, "");
+          return (
+            <button
+              key={gpu.index}
+              type="button"
+              disabled={isAuto}
+              onClick={() => toggleGpu(gpu.index)}
+              className={`rounded-lg border px-2 py-0.5 text-[10px] transition-colors ${
+                isAuto
+                  ? "border-border/50 bg-muted/30 text-muted-foreground/50 cursor-default"
+                  : selected
+                    ? "cursor-pointer border-primary/40 bg-primary/10 text-primary"
+                    : "cursor-pointer border-border text-muted-foreground hover:bg-muted/50"
+              }`}
+            >
+              <span className="font-medium">{gpu.index}</span>
+              <span className="opacity-60"> {shortName} · {gpu.memory_total_gb}GB</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
