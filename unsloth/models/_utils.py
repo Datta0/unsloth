@@ -767,6 +767,8 @@ for model_name in model_architectures:
     config_filename = f"{model_name.title().replace('_','')}Config"  # qwen3 arch folder is qwen3_moe but config is Qwen3Config. Need to remove underscore(_) for now
     try:
         exec(f"from {config_filepath} import {config_filename}", globals())
+        exec(f"from transformers.utils import auto_docstring, logging", globals())
+
     except:
         continue
 
@@ -794,6 +796,17 @@ for model_name in model_architectures:
     if model_name == "mistral":
         if Version(transformers_version) <= Version("4.42.4"):
             config = patch_mistral_nemo_config(config)
+    # Fix NameError 'strict' not defined
+    try:
+        exec("from huggingface_hub.dataclasses import strict", globals())
+    except:
+        exec("def strict(*args, **kwargs):\n    def decorator(cls):\n        return cls\n    return decorator", globals())
+
+    # Fix NameError 'interval' not defined
+    try:
+        exec("from transformers.utils.type_validators import interval", globals())
+    except:
+        exec("class interval:\n    def __init__(self, *args, **kwargs):\n        pass\n    def __call__(self, *args, **kwargs):\n        return kwargs.get('default', None)", globals())
 
     exec(config, globals())
     exec(f"import {config_filepath}", globals())
@@ -2754,17 +2767,23 @@ def get_moe_target_parameters(model, target_modules = None) -> Optional[List[str
     else:
         target_set = set(target_modules) if target_modules else set()
 
-    # gate_up_proj combines both gate_proj and up_proj in MoE
-    # Also match "gate_up_proj" directly since users may specify the fused name
-    if (
-        "gate_proj" in target_set
-        or "up_proj" in target_set
-        or "gate_up_proj" in target_set
-    ):
-        moe_params.append("mlp.experts.gate_up_proj")
-
-    if "down_proj" in target_set:
-        moe_params.append("mlp.experts.down_proj")
+    model_type = getattr(config, "model_type", "")
+    if model_type == "nemotron_h":
+        if "up_proj" in target_set:
+            moe_params.append("mixer.experts.up_proj")
+        if "down_proj" in target_set:
+            moe_params.append("mixer.experts.down_proj")
+    else:
+        # gate_up_proj combines both gate_proj and up_proj in MoE
+        # Also match "gate_up_proj" directly since users may specify the fused name
+        if (
+            "gate_proj" in target_set
+            or "up_proj" in target_set
+            or "gate_up_proj" in target_set
+        ):
+            moe_params.append("mlp.experts.gate_up_proj")
+        if "down_proj" in target_set:
+            moe_params.append("mlp.experts.down_proj")
 
     if moe_params:
         print(
