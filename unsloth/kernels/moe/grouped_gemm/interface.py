@@ -8,6 +8,14 @@ from unsloth import DEVICE_TYPE
 
 import torch
 import triton
+import triton.language as tl
+
+# Shim so Triton JIT AST walker doesn't crash on tl.make_tensor_descriptor in dead branches
+if not hasattr(tl, "make_tensor_descriptor"):
+    if hasattr(tl, "_experimental_make_tensor_descriptor"):
+        tl.make_tensor_descriptor = tl._experimental_make_tensor_descriptor
+    else:
+        tl.make_tensor_descriptor = None
 
 from .kernels.backward import (
     _autotuned_grouped_gemm_dW_kernel,

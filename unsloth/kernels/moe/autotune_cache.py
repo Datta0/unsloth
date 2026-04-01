@@ -230,9 +230,7 @@ def get_or_autotune_moe_kernels(
 
     except Exception as e:
         logger.error(f"MoE kernel auto-tuning failed: {e}")
-        if "AttributeError" in str(e) and "_experimental_make_tensor_descriptor" in str(
-            e
-        ):
+        if "AttributeError" in str(e) and "make_tensor_descriptor" in str(e):
             logger.warning(
                 "Unsloth: Your Triton version might be incompatible with TMA features. Falling back to default configs."
             )
