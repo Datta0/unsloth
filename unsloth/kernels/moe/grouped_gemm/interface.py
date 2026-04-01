@@ -17,6 +17,14 @@ if not hasattr(tl, "make_tensor_descriptor"):
     else:
         tl.make_tensor_descriptor = None
 
+# tl.range gained 'flatten' in Triton ~3.3; patch __init__ so older versions ignore it
+import inspect
+if "flatten" not in inspect.signature(tl.range).parameters:
+    _orig_range_init = tl.range.__init__
+    def _range_init_compat(self, *args, flatten=False, **kwargs):
+        _orig_range_init(self, *args, **kwargs)
+    tl.range.__init__ = _range_init_compat
+
 from .kernels.backward import (
     _autotuned_grouped_gemm_dW_kernel,
     _autotuned_grouped_gemm_dX_kernel,
