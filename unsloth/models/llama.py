@@ -358,6 +358,12 @@ def _fast_prepare_inputs_for_generation(
             if cp.dim() == 1:
                 cp = cp.unsqueeze(0).expand(bs, -1)
             kwargs["position_ids"] = cp
+    else:
+        # Transformers 5.x accumulates position_ids across generation steps;
+        # slice to match current input length (mirrors base class behavior)
+        position_ids = kwargs["position_ids"]
+        if position_ids.shape[-1] != seq_length:
+            kwargs["position_ids"] = position_ids[..., -seq_length:]
 
     result = {
         "attention_mask": attention_mask,
