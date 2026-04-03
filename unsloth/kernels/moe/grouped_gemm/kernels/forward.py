@@ -29,6 +29,10 @@ def _grouped_gemm_forward_kernel(
     m_sizes_ptr,
     gather_indices_ptr,
     topk_weights_ptr,
+    # LoRA weight pointers (only used when FUSE_LORA=True)
+    lora_a_ptr,  # (E, R, K) per-expert LoRA A weights
+    lora_b_ptr,  # (E, N, R) per-expert LoRA B weights
+    lora_scaling,  # float scalar
     # Constant problem shapes
     NUM_EXPERTS: tl.constexpr,
     NUM_TOKENS,
@@ -50,6 +54,10 @@ def _grouped_gemm_forward_kernel(
     USE_TMA_STORE: tl.constexpr = False,
     acc_dtype: tl.constexpr = tl.float32,
     FLATTEN: tl.constexpr = True,
+    # LoRA fusion params (DCE'd when FUSE_LORA=False)
+    FUSE_LORA: tl.constexpr = False,
+    LORA_R: tl.constexpr = 0,
+    BLOCK_R: tl.constexpr = 16,
 ) -> None:
     tl.static_assert(K % BLOCK_SIZE_K == 0)
 
@@ -180,6 +188,12 @@ def _grouped_gemm_forward_kernel(
 
                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype = acc_dtype)
 
+                # LoRA accumulator for X @ A^T, stays in registers
+                if FUSE_LORA:
+                    xa_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_R), dtype = acc_dtype)
+                    r_range = tl.arange(0, BLOCK_R)
+                    r_mask = r_range < LORA_R
+
                 offs_k = tl.arange(0, BLOCK_SIZE_K)
 
                 if not USE_TMA_LOAD_X:
@@ -191,6 +205,15 @@ def _grouped_gemm_forward_kernel(
                         tl.multiple_of(offs_bn % N, BLOCK_SIZE_N), BLOCK_SIZE_N
                     )
                     w_ptrs = w_ptr + (n_start + offs_bn[:, None]) * K + offs_k[None, :]
+
+                # LoRA A pointers: A[expert_idx] is [R, K], load [BLOCK_R, BLOCK_K]
+                if FUSE_LORA:
+                    a_expert_offset = expert_idx * LORA_R
+                    a_ptrs = (
+                        lora_a_ptr
+                        + (a_expert_offset + r_range)[:, None] * K
+                        + offs_k[None, :]
+                    )
 
                 for k_offset in range(0, K, BLOCK_SIZE_K):
                     if not USE_TMA_LOAD_X:
@@ -216,11 +239,35 @@ def _grouped_gemm_forward_kernel(
                     x = x.to(w.dtype)
                     accumulator += tl.dot(x, w.T)
 
+                    # Fused LoRA: accumulate X @ A^T in the same K-loop
+                    if FUSE_LORA:
+                        a = tl.load(a_ptrs, mask = r_mask[:, None])
+                        a = a.to(x.dtype)
+                        xa_acc += tl.dot(x, a.T)  # [M,K] @ [K,R] -> [M,R]
+                        a_ptrs += BLOCK_SIZE_K
+
                     if not USE_TMA_LOAD_X:
                         x_ptrs += BLOCK_SIZE_K
 
                     if not USE_TMA_LOAD_W:
                         w_ptrs += BLOCK_SIZE_K
+
+                # LoRA epilogue: load B[expert] and compute (X@A^T) @ B^T
+                # B layout: (E, N, R) contiguous, so B[e,n,r] = ptr + e*N*R + n*R + r
+                if FUSE_LORA:
+                    b_expert_base = expert_idx * N * LORA_R
+                    b_ptrs = (
+                        lora_b_ptr
+                        + b_expert_base
+                        + offs_bn[:, None] * LORA_R
+                        + r_range[None, :]
+                    )
+                    n_mask_b = offs_bn[:, None] < N
+                    b = tl.load(b_ptrs, mask = n_mask_b & r_mask[None, :])
+                    b = b.to(xa_acc.dtype)
+                    xa_cast = xa_acc.to(b.dtype)
+                    lora_out = tl.dot(xa_cast, b.T)  # [M,R] @ [R,N] -> [M,N]
+                    accumulator += lora_scaling * lora_out
 
                 y = accumulator.to(output_dtype)
 
@@ -263,5 +310,7 @@ _autotuned_grouped_gemm_forward_kernel = triton.autotune(
         "PERMUTE_X",
         "PERMUTE_Y",
         "FUSE_MUL_POST",
+        "FUSE_LORA",
+        "LORA_R",
     ],
 )(_grouped_gemm_forward_kernel)

@@ -151,6 +151,10 @@ def grouped_gemm_forward(
     use_tma_store: bool = False,
     # software pipelining -- set to True for now, won't impact until loop is re-written
     flatten: bool = True,
+    # LoRA fusion (optional)
+    lora_a: torch.Tensor = None,  # (E, R, K)
+    lora_b: torch.Tensor = None,  # (E, N, R)
+    lora_scaling: float = 0.0,
     # debugging
     debug: bool = False,
 ) -> torch.Tensor:
@@ -285,6 +289,19 @@ def grouped_gemm_forward(
             f"DEBUG::GROUPED_GEMM {m_sizes.tolist()} {(gather_indices // topk).tolist()}"
         )
 
+    # LoRA fusion setup
+    fuse_lora = lora_a is not None and lora_b is not None
+    if fuse_lora:
+        lora_a = lora_a.contiguous()
+        lora_b = lora_b.contiguous()
+        lora_r = lora_a.shape[1] if lora_a.ndim == 3 else lora_a.shape[0]
+        # BLOCK_R must be power-of-2 >= max(LORA_R, 16) for tl.dot
+        block_r = max(lora_r, 16)
+        block_r = 1 << (block_r - 1).bit_length()  # next power of 2
+    else:
+        lora_r = 0
+        block_r = 16
+
     kernel_args = {
         # Inputs
         "x_ptr": X,
@@ -292,6 +309,10 @@ def grouped_gemm_forward(
         "m_sizes_ptr": m_sizes,
         "gather_indices_ptr": gather_indices,
         "topk_weights_ptr": topk_weights,
+        # LoRA
+        "lora_a_ptr": lora_a,
+        "lora_b_ptr": lora_b,
+        "lora_scaling": lora_scaling if fuse_lora else 0.0,
         # Output
         "y_ptr": y,
         # Problem shapes
@@ -308,6 +329,10 @@ def grouped_gemm_forward(
         "FUSE_MUL_POST": fuse_mul_post,
         # Loop pipelining
         "FLATTEN": flatten,
+        # LoRA fusion
+        "FUSE_LORA": fuse_lora,
+        "LORA_R": lora_r,
+        "BLOCK_R": block_r,
     }
     if not autotune:
         kernel_args.update(
@@ -362,6 +387,10 @@ def grouped_gemm_dX(
     fuse_mul_pre: bool = False,
     fuse_mul_post: bool = False,
     autotune: bool = False,
+    # LoRA fusion (optional)
+    lora_a: torch.Tensor = None,  # (E, R, K)
+    lora_b: torch.Tensor = None,  # (E, N, R)
+    lora_scaling: float = 0.0,
 ) -> torch.Tensor:
     """
     dX backward kernel
@@ -466,12 +495,28 @@ def grouped_gemm_dX(
         )
         print(f"DEBUG::GROUPED_GEMM {m_sizes.tolist()}")
 
+    # LoRA fusion setup
+    fuse_lora = lora_a is not None and lora_b is not None
+    if fuse_lora:
+        lora_a = lora_a.contiguous()
+        lora_b = lora_b.contiguous()
+        lora_r = lora_a.shape[1] if lora_a.ndim == 3 else lora_a.shape[0]
+        block_r = max(lora_r, 16)
+        block_r = 1 << (block_r - 1).bit_length()
+    else:
+        lora_r = 0
+        block_r = 16
+
     kernel_args = {
         # Inputs
         "dY_ptr": dY,
         "w_ptr": W,
         "gather_indices_ptr": gather_indices,
         "m_sizes_ptr": m_sizes,
+        # LoRA
+        "lora_a_ptr": lora_a,
+        "lora_b_ptr": lora_b,
+        "lora_scaling": lora_scaling if fuse_lora else 0.0,
         # Output
         "dX_ptr": dX,
         # Problem sizes
@@ -485,6 +530,10 @@ def grouped_gemm_dX(
         "PERMUTE_X": permute_x,
         "PERMUTE_Y": permute_y,
         "FLATTEN": flatten,
+        # LoRA fusion
+        "FUSE_LORA": fuse_lora,
+        "LORA_R": lora_r,
+        "BLOCK_R": block_r,
     }
     if not autotune:
         kernel_args.update(
@@ -708,6 +757,10 @@ class GroupedGemm(torch.autograd.Function):
         autotune,
         dX_only,
         dW_only,
+        # LoRA params (optional)
+        lora_a=None,
+        lora_b=None,
+        lora_scaling=0.0,
     ):
         ctx.topk = topk
         ctx.permute_x = permute_x
@@ -719,9 +772,13 @@ class GroupedGemm(torch.autograd.Function):
         ctx.autotune = autotune
         ctx.dX_only = dX_only
         ctx.dW_only = dW_only
+        ctx.has_lora = lora_a is not None and lora_b is not None
+        ctx.lora_scaling = lora_scaling
 
-        # NOTE: we don't save topk_weights for backward since we do not support training with fused_mul
-        ctx.save_for_backward(X, W, m_sizes, gather_indices)
+        if ctx.has_lora:
+            ctx.save_for_backward(X, W, m_sizes, gather_indices, lora_a, lora_b)
+        else:
+            ctx.save_for_backward(X, W, m_sizes, gather_indices)
 
         fwd_config = {}
         if kernel_config_fwd is not None:
@@ -744,16 +801,24 @@ class GroupedGemm(torch.autograd.Function):
             permute_x = permute_x,
             permute_y = permute_y,
             fuse_mul_post = fuse_mul_post,
-            # Autotune -- this will override the manual kernel config if true
             autotune = autotune,
-            # Manual kernel config
+            lora_a = lora_a,
+            lora_b = lora_b,
+            lora_scaling = lora_scaling,
             **fwd_config,
         )
 
     @staticmethod
     def backward(ctx, dY):
+        from .kernels.backward import compute_lora_grads
+
         dY = dY.contiguous()
-        X, W, m_sizes, gather_indices = ctx.saved_tensors
+        has_lora = ctx.has_lora
+        if has_lora:
+            X, W, m_sizes, gather_indices, lora_a, lora_b = ctx.saved_tensors
+        else:
+            X, W, m_sizes, gather_indices = ctx.saved_tensors
+            lora_a = lora_b = None
         topk = ctx.topk
         permute_x = ctx.permute_x
         permute_y = ctx.permute_y
@@ -763,13 +828,14 @@ class GroupedGemm(torch.autograd.Function):
         autotune = ctx.autotune
         dX_only = ctx.dX_only
         dW_only = ctx.dW_only
+        lora_scaling = ctx.lora_scaling
 
         if not autotune:
             if not dW_only:
                 assert (
                     kernel_config_bwd_dX is not None
                 ), "kernel_config_bwd_dX must be provided if autotune is False"
-            if not dX_only:
+            if not dX_only and not has_lora:
                 assert (
                     kernel_config_bwd_dW is not None
                 ), "kernel_config_bwd_dW must be provided if autotune is False"
@@ -778,7 +844,8 @@ class GroupedGemm(torch.autograd.Function):
             not fuse_mul_post
         ), "fused_mul should only be used for inference, not for training"
 
-        if not dX_only:
+        # Skip dW when LoRA is active (base weights are frozen)
+        if not dX_only and not has_lora:
             bwd_dW_config = {}
 
             if kernel_config_bwd_dW is not None:
@@ -799,9 +866,7 @@ class GroupedGemm(torch.autograd.Function):
                 topk = topk,
                 permute_x = permute_x,
                 permute_y = permute_y,
-                # Autotune -- this will override the manual kernel config if true
                 autotune = autotune,
-                # Manual kernel config
                 **bwd_dW_config,
             )
         else:
@@ -827,9 +892,10 @@ class GroupedGemm(torch.autograd.Function):
                 topk = topk,
                 permute_x = permute_x,
                 permute_y = permute_y,
-                # Autotune -- this will override the manual kernel config if true
                 autotune = autotune,
-                # Manual kernel config
+                lora_a = lora_a,
+                lora_b = lora_b,
+                lora_scaling = lora_scaling,
                 **bwd_dX_config,
             )
 
@@ -837,6 +903,25 @@ class GroupedGemm(torch.autograd.Function):
                 dX = dX.view(X.shape[0], topk, -1).sum(dim = 1)
         else:
             dX = None
+
+        # Compute LoRA gradients (dA, dB) if active
+        d_lora_a = None
+        d_lora_b = None
+        if has_lora:
+            # Need grouped X and dY for per-expert gradient computation
+            # When permute_x: X is (num_tokens, K), need to group it
+            # dY is always (total_tokens, N) in expert order
+            offsets = torch.cumsum(m_sizes, dim=0)
+            if permute_x:
+                # X is ungrouped, group it using gather_indices
+                token_indices = gather_indices // topk
+                grouped_x = X[token_indices]
+            else:
+                grouped_x = X
+            d_lora_a, d_lora_b = compute_lora_grads(
+                dY, grouped_x, lora_a, lora_b,
+                offsets, lora_a.shape[0], lora_scaling,
+            )
 
         return (
             dX,
@@ -854,6 +939,9 @@ class GroupedGemm(torch.autograd.Function):
             None,  # autotune
             None,  # dX_only
             None,  # dW_only
+            d_lora_a,  # lora_a
+            d_lora_b,  # lora_b
+            None,  # lora_scaling
         )
 
 
@@ -949,6 +1037,10 @@ def grouped_gemm(
     # Only for debugging
     dX_only: bool = False,
     dW_only: bool = False,
+    # LoRA fusion (optional)
+    lora_a: torch.Tensor = None,
+    lora_b: torch.Tensor = None,
+    lora_scaling: float = 0.0,
 ):
     """
     Grouped GEMM for MoE MLPs.
@@ -1038,4 +1130,7 @@ def grouped_gemm(
         autotune,
         dX_only,
         dW_only,
+        lora_a,
+        lora_b,
+        lora_scaling,
     )

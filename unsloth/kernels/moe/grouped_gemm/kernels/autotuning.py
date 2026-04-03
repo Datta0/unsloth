@@ -383,6 +383,9 @@ def prune_kernel_configs_fwd(configs: list[triton.Config], args, **kwargs):
 
     logger.debug(f"Pruning configs: {len(configs)}")
 
+    fuse_lora = kwargs.get("FUSE_LORA", False)
+    block_r = kwargs.get("BLOCK_R", 16) if fuse_lora else 0
+
     pruned_configs = []
     for config in configs:
         # disable TMA if gpu does not support it
@@ -396,6 +399,35 @@ def prune_kernel_configs_fwd(configs: list[triton.Config], args, **kwargs):
         if config.kwargs["USE_TMA_STORE"] and kwargs["PERMUTE_Y"]:
             continue
 
+        # Extra pruning for fused LoRA: SMEM + register pressure
+        if fuse_lora and block_r > 0:
+            from .tuning import get_device_properties
+            smem_size = get_device_properties().SIZE_SMEM
+            block_m = config.kwargs["BLOCK_SIZE_M"]
+            block_k = config.kwargs["BLOCK_SIZE_K"]
+            block_n = config.kwargs["BLOCK_SIZE_N"]
+            base_smem = estimate_smem_reqs(
+                config.num_stages, block_m, block_n, block_k, dtype,
+            )
+            lora_loop_smem = config.num_stages * block_r * block_k * dtype.itemsize
+            lora_epilogue_smem = block_n * block_r * dtype.itemsize
+            total_smem = base_smem + lora_loop_smem + lora_epilogue_smem
+            if total_smem > smem_size + 50000:
+                continue
+            # Register pressure: acc[M,N] + xa_acc[M,R] + x[M,K] + w[N,K]
+            # + a[R,K] + b[N,R] must fit in ~255 regs per thread
+            live_elements = (
+                block_m * block_n  # acc
+                + block_m * block_r  # xa_acc
+                + block_m * block_k  # x tile
+                + block_n * block_k  # w tile
+                + block_r * block_k  # a tile
+                + block_n * block_r  # b tile (epilogue)
+            )
+            regs_per_thread = live_elements / (32 * config.num_warps) + 40
+            if regs_per_thread > 255:
+                continue
+
         pruned_configs.append(config)
 
     logger.debug(f"Pruned configs: {len(pruned_configs)}")
@@ -406,16 +438,43 @@ def prune_dX_configs(configs: List[triton.Config], args, **kwargs):
     dtype = kwargs["w_ptr"].dtype
 
     logger.debug(f"Pruning configs: {len(configs)}")
+
+    fuse_lora = kwargs.get("FUSE_LORA", False)
+    block_r = kwargs.get("BLOCK_R", 16) if fuse_lora else 0
+
     pruned_configs = []
 
     for config in configs:
         if common_prune_criteria(config, kwargs, dtype):
             continue
         if config.kwargs["USE_TMA_LOAD_dY"] and kwargs["PERMUTE_Y"]:
-            # dynamically disable TMA_LOAD_dY for permuted Y
             config.kwargs["USE_TMA_LOAD_dY"] = False
         if config.kwargs["USE_TMA_STORE"] and kwargs["PERMUTE_X"]:
             continue
+
+        if fuse_lora and block_r > 0:
+            from .tuning import get_device_properties
+            smem_size = get_device_properties().SIZE_SMEM
+            block_m = config.kwargs["BLOCK_SIZE_M"]
+            block_n = config.kwargs["BLOCK_SIZE_N"]
+            block_k = config.kwargs["BLOCK_SIZE_K"]
+            base_smem = estimate_smem_reqs(
+                config.num_stages, block_m, block_n, block_k, dtype,
+            )
+            lora_loop_smem = config.num_stages * block_n * block_r * dtype.itemsize
+            lora_epilogue_smem = block_r * block_k * dtype.itemsize
+            total_smem = base_smem + lora_loop_smem + lora_epilogue_smem
+            if total_smem > smem_size + 50000:
+                continue
+            live_elements = (
+                block_m * block_k + block_m * block_r
+                + block_m * block_n + block_n * block_k
+                + block_n * block_r + block_r * block_k
+            )
+            regs_per_thread = live_elements / (32 * config.num_warps) + 40
+            if regs_per_thread > 255:
+                continue
+
         pruned_configs.append(config)
 
     logger.debug(f"Pruned configs: {len(pruned_configs)}")

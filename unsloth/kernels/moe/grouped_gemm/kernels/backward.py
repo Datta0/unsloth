@@ -51,6 +51,10 @@ def _grouped_gemm_dX_kernel(
     dX_ptr,  # [M_total, K]
     gather_indices_ptr,
     m_sizes_ptr,
+    # LoRA weight pointers (only used when FUSE_LORA=True)
+    lora_a_ptr,  # (E, R, K) per-expert LoRA A weights
+    lora_b_ptr,  # (E, N, R) per-expert LoRA B weights
+    lora_scaling,  # float scalar
     # problem sizes
     NUM_EXPERTS: tl.constexpr,
     NUM_TOKENS,
@@ -68,6 +72,10 @@ def _grouped_gemm_dX_kernel(
     USE_TMA_LOAD_dY: tl.constexpr = False,
     USE_TMA_STORE: tl.constexpr = False,
     FLATTEN: tl.constexpr = True,
+    # LoRA fusion params
+    FUSE_LORA: tl.constexpr = False,
+    LORA_R: tl.constexpr = 0,
+    BLOCK_R: tl.constexpr = 16,
 ) -> None:
     TOTAL_TOKENS = NUM_TOKENS * TOPK
     output_dtype = dX_ptr.dtype.element_ty
@@ -212,6 +220,20 @@ def _grouped_gemm_dX_kernel(
 
                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype = tl.float32)
 
+                # LoRA accumulator for dY @ B, stays in registers
+                if FUSE_LORA:
+                    dy_b_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_R), dtype = tl.float32)
+                    r_range = tl.arange(0, BLOCK_R)
+                    r_mask = r_range < LORA_R
+                    # B pointers: B[expert_idx] is [N, R], load [BLOCK_N, BLOCK_R]
+                    b_expert_base = expert_idx * N * LORA_R
+                    b_ptrs = (
+                        lora_b_ptr
+                        + b_expert_base
+                        + n_block_range[:, None] * LORA_R
+                        + r_range[None, :]
+                    )
+
                 # GEMM main loop
                 for n_offset in range(0, N, BLOCK_SIZE_N):
                     # dY block [M, N]
@@ -229,19 +251,39 @@ def _grouped_gemm_dX_kernel(
                             [expert_idx, n_offset, tile_k_idx * BLOCK_SIZE_K]
                         )
                         w = tl.reshape(w, (BLOCK_SIZE_N, BLOCK_SIZE_K))
-                    # TODO: check if predication along K is needed since we checked that K is divisible by BLOCK_SIZE_K in the forward kernel
 
                     # [M, N] @ [N, K] -> [M, K]
                     dY = dY.to(w.dtype)
                     accumulator += tl.dot(dY, w)  # NOTE: no transpose of b
 
+                    # Fused LoRA: accumulate dY @ B in the same N-loop
+                    if FUSE_LORA:
+                        b = tl.load(b_ptrs, mask = r_mask[None, :])
+                        b = b.to(dY.dtype)
+                        dy_b_acc += tl.dot(dY, b)  # [M,N] @ [N,R] -> [M,R]
+                        b_ptrs += BLOCK_SIZE_N * LORA_R
+
                     # Advance A along contiguous dimension
                     if not USE_TMA_LOAD_dY:
                         dY_ptrs += BLOCK_SIZE_N
-                    # Note we are no longer advancing B along contiguous dimension since weights are arranged as [N, K]
-                    # Instead, we need to stride by K to advance to the [N_BLOCK_SIZE, K_BLOCK_SIZE] tile
                     if not USE_TMA_LOAD_W:
                         w_ptrs += BLOCK_SIZE_N * K
+
+                # LoRA epilogue: load A[expert] and compute (dY@B) @ A
+                # A layout: (E, R, K), so A[e,r,k] = ptr + e*R*K + r*K + k
+                if FUSE_LORA:
+                    a_expert_base = expert_idx * LORA_R * K
+                    a_ptrs = (
+                        lora_a_ptr
+                        + a_expert_base
+                        + r_range[:, None] * K
+                        + (tile_k_idx * BLOCK_SIZE_K + k_block_range)[None, :]
+                    )
+                    a = tl.load(a_ptrs, mask = r_mask[:, None])
+                    a = a.to(dy_b_acc.dtype)
+                    dy_b_cast = dy_b_acc.to(a.dtype)
+                    lora_dx = tl.dot(dy_b_cast, a)  # [M,R] @ [R,K] -> [M,K]
+                    accumulator += lora_scaling * lora_dx
 
                 dX = accumulator.to(output_dtype)
 
@@ -268,7 +310,7 @@ _autotuned_grouped_gemm_dX_kernel = triton.autotune(
     configs = get_dX_kernel_configs(),
     prune_configs_by = {"early_config_prune": prune_dX_configs},
     # NOTE: NUM_TOKENS removed from key to avoid recompilation for every sequence length
-    key = ["NUM_EXPERTS", "N", "K", "PERMUTE_X", "PERMUTE_Y"],
+    key = ["NUM_EXPERTS", "N", "K", "PERMUTE_X", "PERMUTE_Y", "FUSE_LORA", "LORA_R"],
 )(_grouped_gemm_dX_kernel)
 
 """
@@ -503,3 +545,65 @@ _autotuned_grouped_gemm_dW_kernel = triton.autotune(
     # NOTE: NUM_TOKENS removed from key to avoid recompilation for every sequence length
     key = ["NUM_EXPERTS", "N", "K", "PERMUTE_X", "PERMUTE_Y"],
 )(_grouped_gemm_dW_kernel)
+
+
+def compute_lora_grads(
+    dY: torch.Tensor,
+    X: torch.Tensor,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    num_experts: int,
+    scaling: float,
+) -> tuple:
+    """Compute LoRA A and B gradients per-expert using PyTorch ops.
+
+    dA_e = scaling * (dY_e @ B_e)^T @ X_e
+    dB_e = scaling * dY_e^T @ (X_e @ A_e^T)
+
+    Args:
+        dY: (M_total, N) gradients, expert-grouped
+        X: (M_total, K) inputs, expert-grouped
+        lora_A: (E, R, K)
+        lora_B: (E, N, R)
+        expert_offsets: (E,) cumulative token counts
+        num_experts: number of experts
+        scaling: LoRA scaling factor
+
+    Returns:
+        dA: (E, R, K)
+        dB: (E, N, R)
+    """
+    E = num_experts
+    R = lora_A.shape[1]
+    K = lora_A.shape[2]
+    N = lora_B.shape[1]
+    compute_dtype = dY.dtype
+
+    dA = torch.zeros_like(lora_A)
+    dB = torch.zeros_like(lora_B)
+
+    prev_offset = 0
+    for e in range(E):
+        curr_offset = expert_offsets[e].item()
+        if curr_offset > prev_offset:
+            dy_e = dY[prev_offset:curr_offset]  # (M_e, N)
+            x_e = X[prev_offset:curr_offset]    # (M_e, K)
+            a_e = lora_A[e].to(compute_dtype)   # (R, K)
+            b_e = lora_B[e].to(compute_dtype)   # (N, R)
+
+            # dA_e = scaling * (dY_e @ B_e)^T @ X_e
+            # (dY_e @ B_e): (M_e, N) @ (N, R) -> (M_e, R)
+            dy_b = dy_e @ b_e  # (M_e, R)
+            # (dy_b)^T @ X_e: (R, M_e) @ (M_e, K) -> (R, K)
+            dA[e] = (scaling * (dy_b.T @ x_e)).to(lora_A.dtype)
+
+            # dB_e = scaling * dY_e^T @ (X_e @ A_e^T)
+            # (X_e @ A_e^T): (M_e, K) @ (K, R) -> (M_e, R)
+            x_a = x_e @ a_e.T  # (M_e, R)
+            # dY_e^T @ x_a: (N, M_e) @ (M_e, R) -> (N, R)
+            dB[e] = (scaling * (dy_e.T @ x_a)).to(lora_B.dtype)
+
+        prev_offset = curr_offset
+
+    return dA, dB
