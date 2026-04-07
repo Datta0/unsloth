@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { GpuSelector } from "@/components/gpu-selector";
 import { SectionCard } from "@/components/section-card";
 import { Button } from "@/components/ui/button";
 import { ChartContainer } from "@/components/ui/chart";
@@ -107,7 +108,7 @@ export function TrainingSection() {
         accent="blue"
         className={hasMessage ? "min-h-studio-config-column" : "h-studio-config-column"}
       >
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-4 h-full">
         {/* Loss chart */}
         <div className="relative  ">
           <ChartContainer
@@ -152,6 +153,14 @@ export function TrainingSection() {
           </div>
         </div>
 
+        <GpuSelector
+          gpuAuto={store.gpuAuto}
+          selectedGpuIds={store.gpuIds}
+          onAutoChange={store.setGpuAuto}
+          onGpuToggle={store.toggleGpuId}
+          onGpuIdsChange={store.setGpuIds}
+        />
+
         {/* Start/Stop */}
         <Button
           data-tour="studio-start"
@@ -175,8 +184,9 @@ export function TrainingSection() {
         )}
 
         {/* Upload / Save / Reset */}
-        <p className="text-xs text-muted-foreground">Training Config</p>
-        <div className="grid grid-cols-3 gap-2">
+        <div className="mt-auto flex flex-col gap-1.5">
+          <p className="text-xs text-muted-foreground">Training Config</p>
+          <div className="grid grid-cols-3 gap-2">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -222,13 +232,14 @@ export function TrainingSection() {
             <TooltipContent>Reset to model defaults</TooltipContent>
           </Tooltip>
         </div>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".yaml,.yml"
-          className="hidden"
-          onChange={handleFileUpload}
-        />
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".yaml,.yml"
+            className="hidden"
+            onChange={handleFileUpload}
+          />
+        </div>
         </div>
       </SectionCard>
     </div>

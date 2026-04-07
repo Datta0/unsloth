@@ -54,6 +54,7 @@ export interface TrainingStartRequest {
   wandb_project: string | null;
   enable_tensorboard: boolean;
   tensorboard_dir: string | null;
+  gpu_ids: number[] | null;
 }
 
 export interface TrainingStartResponse {

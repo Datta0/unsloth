@@ -86,6 +86,8 @@ const initialState: TrainingConfigState = {
   isDatasetAudio: false,
   maxPositionEmbeddings: null,
   ...DEFAULT_HYPERPARAMS,
+  gpuAuto: true,
+  gpuIds: [],
 };
 
 // AbortController for in-flight dataset multimodal checks.
@@ -111,6 +113,8 @@ const NON_PERSISTED_STATE_KEYS: ReadonlySet<keyof TrainingConfigState> = new Set
   "isDatasetAudio",
   "trainOnCompletions",
   "maxPositionEmbeddings",
+  "gpuAuto",
+  "gpuIds",
 ]);
 
 function partializePersistedState(
@@ -547,6 +551,17 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
         setFinetuneMLPModules: (finetuneMLPModules) =>
           set({ finetuneMLPModules }),
         setTargetModules: (targetModules) => set({ targetModules }),
+        setGpuAuto: (value) => set({ gpuAuto: value }),
+        setGpuIds: (value) => set({ gpuIds: value }),
+        toggleGpuId: (id) =>
+          set((state) => {
+            const current = state.gpuIds;
+            const next = current.includes(id)
+              ? current.filter((g) => g !== id)
+              : [...current, id];
+            if (next.length === 0) return state;
+            return { gpuIds: next };
+          }),
         canProceed: () => canProceedForStep(get()),
         reset: () => set(initialState),
         resetToModelDefaults: () => {

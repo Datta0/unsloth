@@ -108,5 +108,6 @@ export function buildTrainingStartPayload(
     tensorboard_dir: config.enableTensorboard
       ? config.tensorboardDir.trim() || null
       : null,
+    gpu_ids: config.gpuAuto || config.gpuIds.length === 0 ? null : config.gpuIds,
   };
 }

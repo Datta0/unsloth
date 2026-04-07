@@ -19,6 +19,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Progress } from "@/components/ui/progress";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { OPTIMIZER_OPTIONS } from "@/config/training";
 import { setTrainingCompareHandoff } from "@/features/chat";
 import {
@@ -40,7 +41,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { type ReactElement, type ReactNode, useState } from "react";
+import { type ReactElement, type ReactNode, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChartSettingsSheet } from "./charts/chart-settings-sheet";
 import {
@@ -303,7 +304,15 @@ function LiveGpuPanel({
 }: {
   isTrainingRunning: boolean;
 }): ReactElement {
-  const gpu = useGpuUtilization(isTrainingRunning);
+  const { aggregate, devices } = useGpuUtilization(isTrainingRunning);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const isMultiGpu = devices.length > 1;
+
+  const safeIndex = Math.min(selectedIndex, Math.max(0, devices.length - 1));
+  const gpu = useMemo(
+    () => (isMultiGpu ? devices[safeIndex] ?? aggregate : aggregate),
+    [isMultiGpu, devices, safeIndex, aggregate],
+  );
 
   return (
     <div className="flex flex-col gap-3">
@@ -313,6 +322,26 @@ function LiveGpuPanel({
         </p>
         <span className="text-[11px] text-muted-foreground">Live</span>
       </div>
+
+      {isMultiGpu && (
+        <Tabs
+          value={String(safeIndex)}
+          onValueChange={(v) => setSelectedIndex(Number(v))}
+        >
+          <TabsList className="h-7 w-full">
+            {devices.map((d, i) => (
+              <TabsTrigger
+                key={d.index}
+                value={String(i)}
+                className="text-[11px] h-6 px-2"
+              >
+                GPU {d.index}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+      )}
+
       <div className="grid grid-cols-2 gap-2.5">
         <GpuStat
           label="Utilization"

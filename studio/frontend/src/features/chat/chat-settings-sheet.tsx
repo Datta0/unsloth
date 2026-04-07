@@ -49,6 +49,8 @@ import {
 } from "./types/runtime";
 import { useChatRuntimeStore } from "./stores/chat-runtime-store";
 import { Switch } from "@/components/ui/switch";
+import { GpuSelector } from "@/components/gpu-selector";
+import { useGpuVisibility } from "@/hooks/use-gpu-visibility";
 
 export const defaultInferenceParams = DEFAULT_INFERENCE_PARAMS;
 export type { InferenceParams } from "./types/runtime";
@@ -289,6 +291,12 @@ export function ChatSettingsPanel({
   const kvDirty = kvCacheDtype !== loadedKvCacheDtype;
   const ctxDirty = customContextLength !== null;
   const modelSettingsDirty = kvDirty || ctxDirty;
+  const { isMultiGpu } = useGpuVisibility();
+  const gpuAuto = useChatRuntimeStore((s) => s.gpuAuto);
+  const gpuIds = useChatRuntimeStore((s) => s.gpuIds);
+  const setGpuAuto = useChatRuntimeStore((s) => s.setGpuAuto);
+  const setGpuIds = useChatRuntimeStore((s) => s.setGpuIds);
+  const toggleGpuId = useChatRuntimeStore((s) => s.toggleGpuId);
   const [customPresets, setCustomPresets] = useState<Preset[]>(() =>
     loadSavedCustomPresets(),
   );
@@ -572,6 +580,18 @@ export function ChatSettingsPanel({
                   <Switch
                     checked={params.trustRemoteCode ?? false}
                     onCheckedChange={set("trustRemoteCode")}
+                  />
+                </div>
+              )}
+              {!isGguf && isMultiGpu && (
+                <div className="pt-1">
+                  <div className="text-xs font-medium mb-1.5">GPU Selection</div>
+                  <GpuSelector
+                    gpuAuto={gpuAuto}
+                    selectedGpuIds={gpuIds}
+                    onAutoChange={setGpuAuto}
+                    onGpuToggle={toggleGpuId}
+                    onGpuIdsChange={setGpuIds}
                   />
                 </div>
               )}

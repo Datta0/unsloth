@@ -10,4 +10,5 @@ export { useRecommendedModelVram } from "./use-recommended-model-vram";
 export { useHfDatasetSearch } from "./use-hf-dataset-search";
 export { useHfDatasetSplits } from "./use-hf-dataset-splits";
 export { useHfTokenValidation } from "./use-hf-token-validation";
+export { useGpuVisibility } from "./use-gpu-visibility";
 export { useInfiniteScroll } from "./use-infinite-scroll";

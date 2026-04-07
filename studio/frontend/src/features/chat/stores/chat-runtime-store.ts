@@ -16,6 +16,8 @@ const MAX_TOOL_CALLS_KEY = "unsloth_max_tool_calls_per_message";
 const TOOL_CALL_TIMEOUT_KEY = "unsloth_tool_call_timeout";
 const HF_TOKEN_KEY = "unsloth_hf_token";
 const INFERENCE_PARAMS_KEY = "unsloth_chat_inference_params";
+const GPU_AUTO_KEY = "unsloth_chat_gpu_auto";
+const GPU_IDS_KEY = "unsloth_chat_gpu_ids";
 let hasShownInferencePersistenceWarning = false;
 
 function canUseStorage(): boolean {
@@ -76,6 +78,27 @@ function saveString(key: string, value: string): void {
   if (!canUseStorage()) return;
   try {
     localStorage.setItem(key, value);
+  } catch {
+    // ignore
+  }
+}
+
+function loadIntArray(key: string, fallback: number[]): number[] {
+  if (!canUseStorage()) return fallback;
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return fallback;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((n: unknown) => typeof n === "number") : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveIntArray(key: string, value: number[]): void {
+  if (!canUseStorage()) return;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
   } catch {
     // ignore
   }
@@ -177,7 +200,12 @@ type ChatRuntimeStore = {
     cachedTokens: number;
   } | null;
   modelLoading: boolean;
+  gpuAuto: boolean;
+  gpuIds: number[];
   setModelLoading: (loading: boolean) => void;
+  setGpuAuto: (auto: boolean) => void;
+  setGpuIds: (ids: number[]) => void;
+  toggleGpuId: (id: number) => void;
   setParams: (params: InferenceParams) => void;
   setModels: (models: ChatModelSummary[]) => void;
   setLoras: (loras: ChatLoraSummary[]) => void;
@@ -236,7 +264,27 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   pendingAudioName: null,
   contextUsage: null,
   modelLoading: false,
+  gpuAuto: loadBool(GPU_AUTO_KEY, true),
+  gpuIds: loadIntArray(GPU_IDS_KEY, []),
   setModelLoading: (loading) => set({ modelLoading: loading }),
+  setGpuAuto: (auto) => {
+    set({ gpuAuto: auto });
+    saveBool(GPU_AUTO_KEY, auto);
+  },
+  setGpuIds: (ids) => {
+    set({ gpuIds: ids });
+    saveIntArray(GPU_IDS_KEY, ids);
+  },
+  toggleGpuId: (id) =>
+    set((state) => {
+      const current = state.gpuIds;
+      const next = current.includes(id)
+        ? current.filter((g) => g !== id)
+        : [...current, id];
+      if (next.length === 0) return state;
+      saveIntArray(GPU_IDS_KEY, next);
+      return { gpuIds: next };
+    }),
   setParams: (params) =>
     set(() => {
       const persisted = saveInferenceParams(params);
