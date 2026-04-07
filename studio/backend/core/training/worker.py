@@ -339,19 +339,44 @@ def _activate_transformers_version(model_name: str) -> None:
         logger.info("Using default transformers (4.57.x) for %s", model_name)
 
 
-def run_training_process(
+class _RankAwareEventQueue:
+    def __init__(self, base_queue: Any, *, rank: int):
+        self._base_queue = base_queue
+        self._rank = rank
+
+    def put(self, event: dict) -> None:
+        payload = dict(event)
+        if self._rank != 0:
+            if payload.get("type") != "error":
+                return
+            if "error" in payload:
+                payload["error"] = f"[Rank {self._rank}] {payload['error']}"
+
+        payload.setdefault("rank", self._rank)
+        self._base_queue.put(payload)
+
+
+def _configure_distributed_rank_env(config: dict) -> None:
+    os.environ["MASTER_ADDR"] = str(config["distributed_master_addr"])
+    os.environ["MASTER_PORT"] = str(config["distributed_master_port"])
+    os.environ["RANK"] = str(config["distributed_rank"])
+    os.environ["WORLD_SIZE"] = str(config["distributed_world_size"])
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["LOCAL_WORLD_SIZE"] = "1"
+    os.environ["NODE_RANK"] = "0"
+
+    if config.get("distributed_launch_mode") == "distributed_group_shard":
+        os.environ["UNSLOTH_STUDIO_ALLOW_DISTRIBUTED_DEVICE_MAP"] = "1"
+    else:
+        os.environ.pop("UNSLOTH_STUDIO_ALLOW_DISTRIBUTED_DEVICE_MAP", None)
+
+
+def _run_training_process_main(
     *,
     event_queue: Any,
     stop_queue: Any,
     config: dict,
 ) -> None:
-    """Subprocess entrypoint. Fresh Python — no stale module state.
-
-    Args:
-        event_queue: mp.Queue for sending progress/status/error events to parent.
-        stop_queue: mp.Queue for receiving stop commands from parent.
-        config: Training configuration dict with all parameters.
-    """
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["PYTHONWARNINGS"] = (
         "ignore"  # Suppress warnings at C-level before imports
@@ -368,7 +393,8 @@ def run_training_process(
         env = os.getenv("ENVIRONMENT_TYPE", "production"),
     )
 
-    apply_gpu_ids(config.get("resolved_gpu_ids"))
+    active_gpu_ids = config.get("active_gpu_ids", config.get("resolved_gpu_ids"))
+    apply_gpu_ids(active_gpu_ids)
 
     model_name = config["model_name"]
 
@@ -690,7 +716,7 @@ def run_training_process(
             is_dataset_image = config.get("is_dataset_image", False),
             is_dataset_audio = config.get("is_dataset_audio", False),
             trust_remote_code = config.get("trust_remote_code", False),
-            gpu_ids = config.get("resolved_gpu_ids"),
+            gpu_ids = active_gpu_ids,
         )
         if not success or trainer.should_stop:
             if trainer.should_stop:
@@ -850,6 +876,37 @@ def run_training_process(
         )
 
 
+def run_training_process(
+    *,
+    event_queue: Any,
+    stop_queue: Any,
+    config: dict,
+) -> None:
+    _run_training_process_main(
+        event_queue = event_queue,
+        stop_queue = stop_queue,
+        config = config,
+    )
+
+
+def run_training_rank_process(
+    *,
+    event_queue: Any,
+    stop_queue: Any,
+    config: dict,
+) -> None:
+    _configure_distributed_rank_env(config)
+    rank_queue = _RankAwareEventQueue(
+        event_queue,
+        rank = config.get("distributed_rank", 0),
+    )
+    _run_training_process_main(
+        event_queue = rank_queue,
+        stop_queue = stop_queue,
+        config = config,
+    )
+
+
 def _send_status(event_queue: Any, message: str) -> None:
     """Send a status update to the parent process."""
     event_queue.put(
@@ -878,6 +935,20 @@ def _run_embedding_training(event_queue: Any, stop_queue: Any, config: dict) -> 
 
     model_name = config["model_name"]
     training_start_time = time.time()
+
+    if config.get("distributed_launch_mode") == "distributed_group_shard":
+        event_queue.put(
+            {
+                "type": "error",
+                "error": (
+                    "Embedding training does not support multi-GPU shard groups yet. "
+                    "Reduce the shard width to 1 GPU per replica or fall back to single-process sharding."
+                ),
+                "stack": "",
+                "ts": time.time(),
+            }
+        )
+        return
 
     # ── 1. Import embedding-specific libraries ──
     _send_status(event_queue, "Importing embedding libraries...")
@@ -1127,6 +1198,7 @@ def _run_embedding_training(event_queue: Any, stop_queue: Any, config: dict) -> 
     num_epochs = config.get("num_epochs", 2)
     batch_size = config.get("batch_size", 256)
     gradient_accumulation_steps = config.get("gradient_accumulation_steps", 1)
+    data_parallel_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
     max_steps_val = config.get("max_steps", 0)
     save_steps_val = config.get("save_steps", 0)
     warmup_ratio = config.get("warmup_ratio", 0.03)
@@ -1148,6 +1220,7 @@ def _run_embedding_training(event_queue: Any, stop_queue: Any, config: dict) -> 
         "optim": config.get("optim", "adamw_8bit"),
         "weight_decay": config.get("weight_decay", 0.001),
         "seed": config.get("random_seed", 3407),
+        "ddp_find_unused_parameters": False if data_parallel_size > 1 else None,
     }
 
     # max_steps vs epochs
@@ -1174,7 +1247,7 @@ def _run_embedding_training(event_queue: Any, stop_queue: Any, config: dict) -> 
         total_steps = max_steps_val
     else:
         effective_epochs = num_epochs if num_epochs > 0 else 2
-        len_dataloader = math.ceil(len(dataset) / batch_size)
+        len_dataloader = math.ceil(len(dataset) / (batch_size * data_parallel_size))
         steps_per_epoch = max(len_dataloader // gradient_accumulation_steps, 1)
         total_steps = steps_per_epoch * effective_epochs
 

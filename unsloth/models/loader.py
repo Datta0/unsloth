@@ -303,7 +303,14 @@ class FastLanguageModel(FastLlamaModel):
         # In multi-GPU (torchrun), each rank must load the model on its own device
         # to avoid Accelerate device relocation errors with quantized weights.
         is_quantized = load_in_4bit or load_in_8bit or load_in_fp8
-        if is_quantized and isinstance(device_map, str):
+        allow_distributed_device_map = (
+            os.environ.get("UNSLOTH_STUDIO_ALLOW_DISTRIBUTED_DEVICE_MAP", "0") == "1"
+        )
+        if (
+            is_quantized
+            and isinstance(device_map, str)
+            and not allow_distributed_device_map
+        ):
             distributed_device_map, is_dist = prepare_device_map()
             if is_dist:
                 device_map = distributed_device_map

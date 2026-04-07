@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from core.training.training import TrainingBackend
+from core.training.worker import _RankAwareEventQueue
 from models.inference import LoadRequest
 from models.training import TrainingStartRequest
 from utils.hardware import (
@@ -26,6 +27,7 @@ from utils.hardware import (
     get_parent_visible_gpu_ids,
     get_visible_gpu_utilization,
     prepare_gpu_selection,
+    prepare_training_gpu_topology,
     resolve_requested_gpu_ids,
 )
 import utils.hardware.hardware as _hw_module
@@ -495,6 +497,85 @@ class TestGpuAutoSelection(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(metadata["selection_mode"], "inherit_parent_visible")
         self.assertIsNone(metadata["selected_gpu_ids"])
 
+    def test_prepare_training_gpu_topology_prefers_ddp_when_model_fits_one_gpu(self):
+        fake_devices = {
+            "devices": [
+                {"index": 0, "vram_total_gb": 16.0, "vram_used_gb": 1.0},
+                {"index": 1, "vram_total_gb": 16.0, "vram_used_gb": 1.5},
+                {"index": 2, "vram_total_gb": 16.0, "vram_used_gb": 2.0},
+                {"index": 3, "vram_total_gb": 16.0, "vram_used_gb": 2.5},
+            ]
+        }
+
+        with (
+            patch("utils.hardware.hardware.get_device", return_value = DeviceType.CUDA),
+            patch(
+                "utils.hardware.hardware.estimate_required_model_memory_gb",
+                return_value = (
+                    12.0,
+                    {
+                        "required_gb": 12.0,
+                        "model_size_source": "config",
+                        "vram_breakdown": {"min_per_gpu_1": 12.0},
+                    },
+                ),
+            ),
+            patch(
+                "utils.hardware.hardware.get_visible_gpu_utilization",
+                return_value = fake_devices,
+            ),
+        ):
+            topology = prepare_training_gpu_topology(
+                [0, 1, 2, 3],
+                model_name = "unsloth/test",
+            )
+
+        self.assertEqual(topology["launch_mode"], "distributed_ddp")
+        self.assertEqual(topology["shard_width"], 1)
+        self.assertEqual(topology["replica_groups"], [[0], [1], [2], [3]])
+        self.assertEqual(topology["leftover_gpu_ids"], [])
+        self.assertEqual(topology["selected_gpu_ids"], [0, 1, 2, 3])
+
+    def test_prepare_training_gpu_topology_uses_smallest_group_width_with_remainder(self):
+        fake_devices = {
+            "devices": [
+                {"index": 0, "vram_total_gb": 16.0, "vram_used_gb": 6.0},
+                {"index": 1, "vram_total_gb": 16.0, "vram_used_gb": 6.0},
+                {"index": 2, "vram_total_gb": 16.0, "vram_used_gb": 6.0},
+                {"index": 3, "vram_total_gb": 16.0, "vram_used_gb": 6.0},
+                {"index": 4, "vram_total_gb": 16.0, "vram_used_gb": 6.0},
+            ]
+        }
+
+        with (
+            patch("utils.hardware.hardware.get_device", return_value = DeviceType.CUDA),
+            patch(
+                "utils.hardware.hardware.estimate_required_model_memory_gb",
+                return_value = (
+                    14.0,
+                    {
+                        "required_gb": 14.0,
+                        "model_size_source": "config",
+                        "vram_breakdown": {"min_per_gpu_2": 9.0},
+                    },
+                ),
+            ),
+            patch(
+                "utils.hardware.hardware.get_visible_gpu_utilization",
+                return_value = fake_devices,
+            ),
+        ):
+            topology = prepare_training_gpu_topology(
+                [0, 1, 2, 3, 4],
+                model_name = "unsloth/test",
+            )
+
+        self.assertEqual(topology["launch_mode"], "distributed_group_shard")
+        self.assertEqual(topology["shard_width"], 2)
+        self.assertEqual(topology["replica_groups"], [[0, 1], [2, 3]])
+        self.assertEqual(topology["leftover_gpu_ids"], [4])
+        self.assertEqual(topology["selected_gpu_ids"], [0, 1, 2, 3])
+
 
 class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
     def test_training_backend_resolves_explicit_gpu_ids_before_spawn(self):
@@ -511,11 +592,17 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
                 return None
 
         dummy_queue = object()
+        topology = {
+            "selection_mode": "explicit",
+            "selected_gpu_ids": [1, 2],
+            "replica_groups": [[1, 2]],
+            "launch_mode": "single_process_shard",
+        }
 
         with (
             patch(
-                "core.training.training.prepare_gpu_selection",
-                return_value = ([1, 2], {"selection_mode": "explicit"}),
+                "core.training.training.prepare_training_gpu_topology",
+                return_value = topology,
             ),
             patch(
                 "core.training.training._CTX.Queue",
@@ -539,6 +626,7 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(config["gpu_ids"], [1, 2])
         self.assertEqual(config["resolved_gpu_ids"], [1, 2])
         self.assertEqual(config["gpu_selection"]["selection_mode"], "explicit")
+        self.assertEqual(config["active_gpu_ids"], [1, 2])
 
     def test_training_backend_auto_selects_gpu_ids_when_omitted(self):
         backend = TrainingBackend()
@@ -554,11 +642,17 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
                 return None
 
         dummy_queue = object()
+        topology = {
+            "selection_mode": "auto",
+            "selected_gpu_ids": [0],
+            "replica_groups": [[0]],
+            "launch_mode": "single_process_shard",
+        }
 
         with (
             patch(
-                "core.training.training.prepare_gpu_selection",
-                return_value = ([0, 1], {"selection_mode": "auto"}),
+                "core.training.training.prepare_training_gpu_topology",
+                return_value = topology,
             ),
             patch(
                 "core.training.training._CTX.Queue",
@@ -580,7 +674,7 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
 
         config = mock_process.call_args.kwargs["kwargs"]["config"]
         self.assertIsNone(config["gpu_ids"])
-        self.assertEqual(config["resolved_gpu_ids"], [0, 1])
+        self.assertEqual(config["resolved_gpu_ids"], [0])
         self.assertEqual(config["gpu_selection"]["selection_mode"], "auto")
 
     def test_training_backend_preserves_uuid_parent_visibility_in_auto_mode(self):
@@ -597,10 +691,20 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
                 return None
 
         dummy_queue = object()
+        topology = {
+            "selection_mode": "inherit_parent_visible",
+            "selected_gpu_ids": None,
+            "replica_groups": [],
+            "launch_mode": "inherit_parent_visible",
+        }
 
         with (
             patch.dict(
                 os.environ, {"CUDA_VISIBLE_DEVICES": "GPU-aaa,GPU-bbb"}, clear = True
+            ),
+            patch(
+                "core.training.training.prepare_training_gpu_topology",
+                return_value = topology,
             ),
             patch(
                 "core.training.training._CTX.Queue",
@@ -611,13 +715,6 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
             ) as mock_process,
             patch(
                 "core.training.training.threading.Thread", return_value = DummyThread()
-            ),
-            patch(
-                "utils.hardware.hardware.estimate_required_model_memory_gb",
-                return_value = (
-                    14.0,
-                    {"required_gb": 14.0, "model_size_source": "config"},
-                ),
             ),
         ):
             backend.start_training(
@@ -632,6 +729,85 @@ class TestPreSpawnGpuResolution(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(
             config["gpu_selection"]["selection_mode"], "inherit_parent_visible"
         )
+
+    def test_training_backend_spawns_one_rank_per_replica_group(self):
+        backend = TrainingBackend()
+
+        class DummyProcess:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def start(self):
+                return None
+
+        class DummyThread:
+            def start(self):
+                return None
+
+        event_queue = object()
+        stop_queue_a = object()
+        stop_queue_b = object()
+        topology = {
+            "selection_mode": "explicit",
+            "selected_gpu_ids": [1, 2],
+            "replica_groups": [[1], [2]],
+            "launch_mode": "distributed_ddp",
+        }
+
+        with (
+            patch(
+                "core.training.training.prepare_training_gpu_topology",
+                return_value = topology,
+            ),
+            patch(
+                "core.training.training._CTX.Queue",
+                side_effect = [event_queue, stop_queue_a, stop_queue_b],
+            ),
+            patch(
+                "core.training.training._CTX.Process",
+                side_effect = [DummyProcess(101), DummyProcess(202)],
+            ) as mock_process,
+            patch(
+                "core.training.training.threading.Thread", return_value = DummyThread()
+            ),
+            patch("core.training.training.TrainingBackend._pick_free_port", return_value = 23456),
+        ):
+            backend.start_training(
+                job_id = "test-job-ddp",
+                model_name = "unsloth/test",
+                training_type = "LoRA/QLoRA",
+                gpu_ids = [1, 2],
+            )
+
+        self.assertEqual(mock_process.call_count, 2)
+        first_config = mock_process.call_args_list[0].kwargs["kwargs"]["config"]
+        second_config = mock_process.call_args_list[1].kwargs["kwargs"]["config"]
+        self.assertEqual(first_config["active_gpu_ids"], [1])
+        self.assertEqual(second_config["active_gpu_ids"], [2])
+        self.assertEqual(first_config["distributed_rank"], 0)
+        self.assertEqual(second_config["distributed_rank"], 1)
+        self.assertEqual(first_config["distributed_world_size"], 2)
+        self.assertEqual(second_config["distributed_world_size"], 2)
+
+
+class TestDistributedWorkerHelpers(unittest.TestCase):
+    def test_rank_aware_event_queue_only_forwards_rank_zero_progress(self):
+        class DummyQueue:
+            def __init__(self):
+                self.events = []
+
+            def put(self, event):
+                self.events.append(event)
+
+        q = DummyQueue()
+        rank_queue = _RankAwareEventQueue(q, rank = 1)
+
+        rank_queue.put({"type": "progress", "step": 1})
+        rank_queue.put({"type": "error", "error": "boom"})
+
+        self.assertEqual(len(q.events), 1)
+        self.assertEqual(q.events[0]["type"], "error")
+        self.assertIn("[Rank 1]", q.events[0]["error"])
 
     def test_inference_orchestrator_resolves_explicit_gpu_ids_before_spawn(self):
         class DummyThread:

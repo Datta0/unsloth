@@ -18,6 +18,7 @@ import json as _json
 import math
 import multiprocessing as mp
 import queue
+import socket
 import threading
 import time
 import structlog
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Any
 
 import matplotlib.pyplot as plt
-from utils.hardware import prepare_gpu_selection
+from utils.hardware import prepare_training_gpu_topology
 
 logger = get_logger(__name__)
 
@@ -71,8 +72,10 @@ class TrainingBackend:
     def __init__(self):
         # Subprocess state
         self._proc: Optional[mp.Process] = None
+        self._procs: list[mp.Process] = []
         self._event_queue: Any = None
         self._stop_queue: Any = None
+        self._stop_queues: list[Any] = []
         self._pump_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
@@ -117,7 +120,7 @@ class TrainingBackend:
         Returns True if the subprocess was started successfully.
         """
         with self._lock:
-            if self._proc is not None and self._proc.is_alive():
+            if any(proc.is_alive() for proc in self._procs):
                 logger.warning("Training subprocess already running")
                 return False
 
@@ -193,8 +196,7 @@ class TrainingBackend:
         if config["training_type"] != "LoRA/QLoRA":
             config["load_in_4bit"] = False
 
-        # Spawn subprocess — use locals so state is untouched on failure
-        resolved_gpu_ids, gpu_selection = prepare_gpu_selection(
+        gpu_topology = prepare_training_gpu_topology(
             kwargs.get("gpu_ids"),
             model_name = config["model_name"],
             hf_token = config["hf_token"] or None,
@@ -207,30 +209,76 @@ class TrainingBackend:
             gradient_checkpointing = config.get("gradient_checkpointing", "unsloth"),
             optimizer = config.get("optim", "adamw_8bit"),
         )
-        config["resolved_gpu_ids"] = resolved_gpu_ids
-        config["gpu_selection"] = gpu_selection
+        config["gpu_topology"] = gpu_topology
+        config["gpu_selection"] = gpu_topology
+        config["resolved_gpu_ids"] = gpu_topology.get("selected_gpu_ids")
+        config["active_gpu_ids"] = gpu_topology.get("selected_gpu_ids")
+        config["data_parallel_size"] = max(
+            1, len(gpu_topology.get("replica_groups") or [])
+        )
 
-        from .worker import run_training_process
+        from .worker import run_training_process, run_training_rank_process
 
         event_queue = _CTX.Queue()
-        stop_queue = _CTX.Queue()
+        stop_queues = []
+        procs = []
 
-        proc = _CTX.Process(
-            target = run_training_process,
-            kwargs = {
-                "event_queue": event_queue,
-                "stop_queue": stop_queue,
-                "config": config,
-            },
-            daemon = True,
-        )
+        launch_mode = gpu_topology.get("launch_mode")
+        if launch_mode in ("distributed_ddp", "distributed_group_shard"):
+            replica_groups = gpu_topology.get("replica_groups") or []
+            master_addr = "127.0.0.1"
+            master_port = self._pick_free_port()
+            for rank, gpu_group in enumerate(replica_groups):
+                rank_config = dict(config)
+                rank_config["active_gpu_ids"] = gpu_group
+                rank_config["distributed_rank"] = rank
+                rank_config["distributed_world_size"] = len(replica_groups)
+                rank_config["distributed_master_addr"] = master_addr
+                rank_config["distributed_master_port"] = master_port
+                rank_config["distributed_launch_mode"] = launch_mode
+
+                stop_queue = _CTX.Queue()
+                proc = _CTX.Process(
+                    target = run_training_rank_process,
+                    kwargs = {
+                        "event_queue": event_queue,
+                        "stop_queue": stop_queue,
+                        "config": rank_config,
+                    },
+                    daemon = False,
+                )
+                stop_queues.append(stop_queue)
+                procs.append(proc)
+        else:
+            stop_queue = _CTX.Queue()
+            proc = _CTX.Process(
+                target = run_training_process,
+                kwargs = {
+                    "event_queue": event_queue,
+                    "stop_queue": stop_queue,
+                    "config": config,
+                },
+                daemon = True,
+            )
+            stop_queues.append(stop_queue)
+            procs.append(proc)
+
         try:
-            proc.start()
+            for proc in procs:
+                proc.start()
         except Exception:
             logger.error("Failed to start training subprocess", exc_info = True)
+            for proc in procs:
+                if proc.is_alive():
+                    proc.terminate()
             return False
 
-        logger.info("Training subprocess started (pid=%s)", proc.pid)
+        logger.info(
+            "Training worker processes started",
+            pids = [proc.pid for proc in procs],
+            launch_mode = launch_mode,
+            replica_groups = gpu_topology.get("replica_groups"),
+        )
 
         # Reset state — safe because old pump thread is confirmed dead
         # and proc.start() succeeded
@@ -260,8 +308,10 @@ class TrainingBackend:
 
         # Assign subprocess handles after state reset
         self._event_queue = event_queue
-        self._stop_queue = stop_queue
-        self._proc = proc
+        self._stop_queues = stop_queues
+        self._stop_queue = stop_queues[0]
+        self._procs = procs
+        self._proc = procs[0]
 
         # Eagerly create DB run row so the run appears in history during model loading
         self._ensure_db_run_created()
@@ -278,9 +328,9 @@ class TrainingBackend:
         if not save:
             self._cancel_requested = True
         with self._lock:
-            if self._stop_queue is not None:
+            for stop_queue in self._stop_queues:
                 try:
-                    self._stop_queue.put({"type": "stop", "save": save})
+                    stop_queue.put({"type": "stop", "save": save})
                 except (OSError, ValueError):
                     pass
             # Update progress immediately for responsive UI
@@ -293,19 +343,7 @@ class TrainingBackend:
 
     def force_terminate(self) -> None:
         """Force-kill the training subprocess so state can be reset immediately."""
-        with self._lock:
-            if self._proc is not None and self._proc.is_alive():
-                logger.info(
-                    "Force-terminating training subprocess (pid=%s)", self._proc.pid
-                )
-                self._proc.terminate()
-            proc = self._proc
-
-        if proc is not None:
-            proc.join(timeout = 5.0)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(timeout = 2.0)
+        self._terminate_active_processes()
 
         # Wait for pump thread to finish DB finalization before returning
         # (8s covers SQLite's default 5s lock timeout plus execution overhead)
@@ -316,7 +354,7 @@ class TrainingBackend:
         """Check if training is currently active."""
         with self._lock:
             # Subprocess alive = active
-            if self._proc is not None and self._proc.is_alive():
+            if any(proc.is_alive() for proc in self._procs):
                 return True
 
             # Stop was requested and process exited → inactive
@@ -420,7 +458,7 @@ class TrainingBackend:
     def _pump_loop(self) -> None:
         """Background thread: consume events from subprocess → update state."""
         while True:
-            if self._proc is None or self._event_queue is None:
+            if not self._procs or self._event_queue is None:
                 return
 
             # Try to read an event
@@ -429,8 +467,24 @@ class TrainingBackend:
                 self._handle_event(event)
                 continue
 
-            # No event — check if process is still alive
-            if self._proc.is_alive():
+            failed_procs = [
+                proc for proc in self._procs if proc.exitcode not in (None, 0)
+            ]
+            if failed_procs and any(proc.is_alive() for proc in self._procs):
+                logger.error(
+                    "Training rank exited unexpectedly; terminating remaining ranks",
+                    exitcodes = {proc.pid: proc.exitcode for proc in failed_procs},
+                )
+                with self._lock:
+                    if not self._progress.error:
+                        self._progress.error = (
+                            "A distributed training rank exited unexpectedly"
+                        )
+                    self._progress.is_training = False
+                self._terminate_active_processes()
+                continue
+
+            if any(proc.is_alive() for proc in self._procs):
                 continue
 
             # Process exited — drain remaining events
@@ -458,6 +512,28 @@ class TrainingBackend:
                 else "Training process terminated unexpectedly",
             )
             return
+
+    def _terminate_active_processes(self) -> None:
+        with self._lock:
+            procs = list(self._procs)
+
+        for proc in procs:
+            if proc.is_alive():
+                logger.info("Force-terminating training subprocess (pid=%s)", proc.pid)
+                proc.terminate()
+
+        for proc in procs:
+            proc.join(timeout = 5.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout = 2.0)
+
+    @staticmethod
+    def _pick_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return sock.getsockname()[1]
 
     def _handle_event(self, event: dict) -> None:
         """Apply a subprocess event to local state.

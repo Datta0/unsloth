@@ -305,7 +305,8 @@ class UnslothTrainer:
         """Calculate total training steps from dataset size and training params."""
         if max_steps and max_steps > 0:
             return max_steps
-        len_dataloader = math.ceil(num_samples / batch_size)
+        data_parallel_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        len_dataloader = math.ceil(num_samples / (batch_size * data_parallel_size))
         steps_per_epoch = max(
             len_dataloader // grad_accum + int(len_dataloader % grad_accum > 0), 1
         )
@@ -328,6 +329,7 @@ class UnslothTrainer:
         lr_scheduler_type = training_args.get("lr_scheduler_type", "linear")
         random_seed = training_args.get("random_seed", 3407)
         optim_value = training_args.get("optim", "adamw_8bit")
+        data_parallel_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
         config = {
             "per_device_train_batch_size": batch_size,
@@ -343,6 +345,7 @@ class UnslothTrainer:
             "seed": random_seed,
             "output_dir": output_dir,
             "report_to": _build_report_targets(training_args),
+            "ddp_find_unused_parameters": False if data_parallel_size > 1 else None,
         }
 
         if training_args.get("enable_tensorboard", False):
@@ -3053,6 +3056,9 @@ class UnslothTrainer:
                     else max(1, (os.cpu_count() or 1) // 4)
                 ),
                 "max_seq_length": training_args.get("max_seq_length", 2048),
+                "ddp_find_unused_parameters": False
+                if int(os.environ.get("WORLD_SIZE", "1")) > 1
+                else None,
             }
             if training_args.get("enable_tensorboard", False):
                 config_args["logging_dir"] = str(

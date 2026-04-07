@@ -882,6 +882,306 @@ def estimate_required_model_memory_gb(
     return required_gb, metadata
 
 
+def _group_usable_gb(group: list[dict[str, Any]], multi_gpu_overhead: float) -> float:
+    if not group:
+        return 0.0
+    usable_gb = group[0]["free_gb"]
+    if len(group) == 1:
+        return usable_gb
+    usable_gb += sum(item["free_gb"] * multi_gpu_overhead for item in group[1:])
+    return usable_gb
+
+
+def _group_fits_requirement(
+    group: list[dict[str, Any]],
+    *,
+    required_gb: float,
+    vram_breakdown: dict[str, Any],
+    multi_gpu_overhead: float,
+) -> tuple[bool, float]:
+    usable_gb = _group_usable_gb(group, multi_gpu_overhead)
+    if usable_gb < required_gb:
+        return False, usable_gb
+
+    if len(group) > 1:
+        min_key = f"min_per_gpu_{len(group)}"
+        min_per_gpu_gb = vram_breakdown.get(min_key)
+        if min_per_gpu_gb is not None:
+            smallest_free = min(item["free_gb"] for item in group)
+            if smallest_free < min_per_gpu_gb:
+                return False, usable_gb
+
+    return True, usable_gb
+
+
+def _make_gpu_topology(
+    *,
+    selection_mode: str,
+    requested_gpu_ids: Optional[list[int]],
+    candidate_gpu_ids: Optional[list[int]],
+    selected_gpu_ids: Optional[list[int]],
+    replica_groups: Optional[list[list[int]]],
+    leftover_gpu_ids: Optional[list[int]],
+    shard_width: Optional[int],
+    fit_group_count: int,
+    launch_mode: str,
+    device_map_mode: str,
+    required_gb: Optional[float],
+    estimate_metadata: Optional[dict[str, Any]] = None,
+    usable_gb: Optional[float] = None,
+    parent_cuda_visible_devices: Optional[str] = None,
+) -> dict[str, Any]:
+    topology = {
+        "selection_mode": selection_mode,
+        "requested_gpu_ids": requested_gpu_ids,
+        "candidate_gpu_ids": candidate_gpu_ids,
+        "selected_gpu_ids": selected_gpu_ids,
+        "replica_groups": replica_groups or [],
+        "leftover_gpu_ids": leftover_gpu_ids or [],
+        "shard_width": shard_width,
+        "fit_group_count": fit_group_count,
+        "launch_mode": launch_mode,
+        "device_map_mode": device_map_mode,
+        "required_gb": required_gb,
+        "usable_gb": usable_gb,
+        "parent_cuda_visible_devices": parent_cuda_visible_devices,
+    }
+    if estimate_metadata:
+        topology.update(estimate_metadata)
+    return topology
+
+
+def _single_process_training_topology(
+    *,
+    selection_mode: str,
+    requested_gpu_ids: Optional[list[int]],
+    candidate_gpu_ids: Optional[list[int]],
+    selected_gpu_ids: Optional[list[int]],
+    required_gb: Optional[float],
+    estimate_metadata: Optional[dict[str, Any]] = None,
+    usable_gb: Optional[float] = None,
+    parent_cuda_visible_devices: Optional[str] = None,
+) -> dict[str, Any]:
+    return _make_gpu_topology(
+        selection_mode = selection_mode,
+        requested_gpu_ids = requested_gpu_ids,
+        candidate_gpu_ids = candidate_gpu_ids,
+        selected_gpu_ids = selected_gpu_ids,
+        replica_groups = [selected_gpu_ids] if selected_gpu_ids else [],
+        leftover_gpu_ids = [],
+        shard_width = len(selected_gpu_ids) if selected_gpu_ids else None,
+        fit_group_count = 1 if selected_gpu_ids else 0,
+        launch_mode = "single_process_shard",
+        device_map_mode = "balanced"
+        if selected_gpu_ids and len(selected_gpu_ids) > 1
+        else "sequential",
+        required_gb = required_gb,
+        estimate_metadata = estimate_metadata,
+        usable_gb = usable_gb,
+        parent_cuda_visible_devices = parent_cuda_visible_devices,
+    )
+
+
+def prepare_training_gpu_topology(
+    gpu_ids: Optional[list[int]],
+    *,
+    model_name: str,
+    hf_token: Optional[str] = None,
+    training_type: Optional[str] = None,
+    load_in_4bit: bool = True,
+    batch_size: int = 4,
+    max_seq_length: int = 2048,
+    lora_rank: int = 16,
+    target_modules: Optional[list] = None,
+    gradient_checkpointing: str = "unsloth",
+    optimizer: str = "adamw_8bit",
+) -> dict[str, Any]:
+    """Choose the smallest fitting training shard width and replica groups."""
+    requested_gpu_ids = list(gpu_ids) if gpu_ids else None
+    parent_visible_spec = _get_parent_visible_gpu_spec()
+    selection_mode = "explicit" if gpu_ids else "auto"
+
+    if gpu_ids and get_device() != DeviceType.CUDA:
+        raise ValueError(
+            f"gpu_ids {list(gpu_ids)} is only supported on CUDA devices, "
+            f"but the current backend is '{get_device().value}'."
+        )
+
+    if get_device() != DeviceType.CUDA:
+        return _make_gpu_topology(
+            selection_mode = "non_cuda",
+            requested_gpu_ids = requested_gpu_ids,
+            candidate_gpu_ids = requested_gpu_ids,
+            selected_gpu_ids = requested_gpu_ids,
+            replica_groups = [requested_gpu_ids] if requested_gpu_ids else [],
+            leftover_gpu_ids = [],
+            shard_width = len(requested_gpu_ids) if requested_gpu_ids else None,
+            fit_group_count = 1 if requested_gpu_ids else 0,
+            launch_mode = "non_cuda",
+            device_map_mode = "sequential",
+            required_gb = None,
+            parent_cuda_visible_devices = parent_visible_spec["raw"],
+        )
+
+    if gpu_ids:
+        candidate_gpu_ids = resolve_requested_gpu_ids(gpu_ids)
+    else:
+        if not parent_visible_spec["supports_explicit_gpu_ids"]:
+            return _make_gpu_topology(
+                selection_mode = "inherit_parent_visible",
+                requested_gpu_ids = requested_gpu_ids,
+                candidate_gpu_ids = None,
+                selected_gpu_ids = None,
+                replica_groups = [],
+                leftover_gpu_ids = [],
+                shard_width = None,
+                fit_group_count = 0,
+                launch_mode = "inherit_parent_visible",
+                device_map_mode = "balanced"
+                if get_visible_gpu_count() > 1
+                else "sequential",
+                required_gb = None,
+                parent_cuda_visible_devices = parent_visible_spec["raw"],
+            )
+        candidate_gpu_ids = get_parent_visible_gpu_ids()
+
+    required_gb, estimate_metadata = estimate_required_model_memory_gb(
+        model_name,
+        hf_token = hf_token,
+        training_type = training_type,
+        load_in_4bit = load_in_4bit,
+        batch_size = batch_size,
+        max_seq_length = max_seq_length,
+        lora_rank = lora_rank,
+        target_modules = target_modules,
+        gradient_checkpointing = gradient_checkpointing,
+        optimizer = optimizer,
+    )
+    vram_breakdown = estimate_metadata.get("vram_breakdown", {})
+    multi_gpu_overhead = 0.85
+
+    if required_gb is None:
+        return _single_process_training_topology(
+            selection_mode = "fallback_all",
+            requested_gpu_ids = requested_gpu_ids,
+            candidate_gpu_ids = candidate_gpu_ids,
+            selected_gpu_ids = candidate_gpu_ids,
+            required_gb = None,
+            estimate_metadata = estimate_metadata,
+            parent_cuda_visible_devices = parent_visible_spec["raw"],
+        )
+
+    utilization = get_visible_gpu_utilization()
+    devices = utilization.get("devices", [])
+    if not devices or not candidate_gpu_ids:
+        return _single_process_training_topology(
+            selection_mode = "fallback_all",
+            requested_gpu_ids = requested_gpu_ids,
+            candidate_gpu_ids = candidate_gpu_ids,
+            selected_gpu_ids = candidate_gpu_ids,
+            required_gb = required_gb,
+            estimate_metadata = estimate_metadata,
+            parent_cuda_visible_devices = parent_visible_spec["raw"],
+        )
+
+    device_by_index = {device["index"]: device for device in devices}
+    ranked_candidates = []
+    for gpu_id in candidate_gpu_ids:
+        device = device_by_index.get(gpu_id)
+        if device is None:
+            continue
+        total_gb = device.get("vram_total_gb")
+        used_gb = device.get("vram_used_gb")
+        if total_gb is None or used_gb is None:
+            continue
+        ranked_candidates.append(
+            {
+                "index": gpu_id,
+                "free_gb": max(total_gb - used_gb, 0.0),
+            }
+        )
+
+    if len(ranked_candidates) != len(candidate_gpu_ids):
+        return _single_process_training_topology(
+            selection_mode = "fallback_all",
+            requested_gpu_ids = requested_gpu_ids,
+            candidate_gpu_ids = candidate_gpu_ids,
+            selected_gpu_ids = candidate_gpu_ids,
+            required_gb = required_gb,
+            estimate_metadata = estimate_metadata,
+            parent_cuda_visible_devices = parent_visible_spec["raw"],
+        )
+
+    ranked_candidates.sort(key = lambda item: (-item["free_gb"], item["index"]))
+
+    candidate_count = len(ranked_candidates)
+    for shard_width in range(1, candidate_count):
+        groups = []
+        group_usable = []
+        offset = 0
+        while offset + shard_width <= candidate_count:
+            group = ranked_candidates[offset : offset + shard_width]
+            fits, usable_gb = _group_fits_requirement(
+                group,
+                required_gb = required_gb,
+                vram_breakdown = vram_breakdown,
+                multi_gpu_overhead = multi_gpu_overhead,
+            )
+            if not fits:
+                break
+            groups.append([item["index"] for item in group])
+            group_usable.append(round(usable_gb, 3))
+            offset += shard_width
+
+        if groups:
+            selected_gpu_ids = [gpu_id for group in groups for gpu_id in group]
+            selected_gpu_set = set(selected_gpu_ids)
+            leftover_gpu_ids = [
+                item["index"]
+                for item in ranked_candidates
+                if item["index"] not in selected_gpu_set
+            ]
+            launch_mode = (
+                "distributed_ddp"
+                if shard_width == 1 and len(groups) > 1
+                else "distributed_group_shard"
+                if len(groups) > 1
+                else "single_process_shard"
+            )
+            device_map_mode = "sequential" if shard_width == 1 else "balanced"
+            topology = _make_gpu_topology(
+                selection_mode = selection_mode,
+                requested_gpu_ids = requested_gpu_ids,
+                candidate_gpu_ids = candidate_gpu_ids,
+                selected_gpu_ids = selected_gpu_ids,
+                replica_groups = groups,
+                leftover_gpu_ids = leftover_gpu_ids,
+                shard_width = shard_width,
+                fit_group_count = len(groups),
+                launch_mode = launch_mode,
+                device_map_mode = device_map_mode,
+                required_gb = required_gb,
+                estimate_metadata = estimate_metadata,
+                usable_gb = group_usable[0] if group_usable else None,
+                parent_cuda_visible_devices = parent_visible_spec["raw"],
+            )
+            topology["group_usable_gb"] = group_usable
+            return topology
+
+    full_group = [item["index"] for item in ranked_candidates]
+    full_usable_gb = round(_group_usable_gb(ranked_candidates, multi_gpu_overhead), 3)
+    return _single_process_training_topology(
+        selection_mode = "fallback_all",
+        requested_gpu_ids = requested_gpu_ids,
+        candidate_gpu_ids = candidate_gpu_ids,
+        selected_gpu_ids = full_group,
+        required_gb = required_gb,
+        estimate_metadata = estimate_metadata,
+        usable_gb = full_usable_gb,
+        parent_cuda_visible_devices = parent_visible_spec["raw"],
+    )
+
+
 def auto_select_gpu_ids(
     model_name: str,
     *,
