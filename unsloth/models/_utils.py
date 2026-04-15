@@ -231,7 +231,7 @@ def apply_unsloth_gradient_checkpointing(
 # ModernBERT: create_block_mask with _compile=True hits CUDA illegal memory
 # access on some GPU architectures (B200). Falls back to eager safely.
 _FLEX_EXCLUDED_MODELS = ("gpt_oss", "mllama", "nemotron_h", "modernbert")
-_EAGER_ONLY_PREFIXES = ("gemma3n",)
+_EAGER_ONLY_PREFIXES = ("gemma3n", "gemma4_")
 
 
 def _is_flex_excluded(model_type):
