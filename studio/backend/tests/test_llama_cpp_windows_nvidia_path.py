@@ -11,6 +11,7 @@ block. See unslothai/unsloth#5106.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import types as _types
 from pathlib import Path
@@ -25,7 +26,11 @@ if _BACKEND_DIR not in sys.path:
 _loggers_stub = _types.ModuleType("loggers")
 _loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
 sys.modules.setdefault("loggers", _loggers_stub)
-sys.modules.setdefault("structlog", _types.ModuleType("structlog"))
+_structlog_stub = _types.ModuleType("structlog")
+_structlog_stub.get_logger = lambda name = None: __import__("logging").getLogger(
+    name or "structlog"
+)
+sys.modules.setdefault("structlog", _structlog_stub)
 
 _httpx_stub = _types.ModuleType("httpx")
 for _exc_name in (
@@ -257,3 +262,88 @@ class TestWindowsPipNvidiaDllDirs:
         assert arch_bin in result_paths
         assert outer_bin in result_paths
         assert result_paths.index(arch_bin) < result_paths.index(outer_bin)
+
+
+_EXE = "llama-server.exe"
+
+
+def _make_exe(path: Path) -> Path:
+    path.parent.mkdir(parents = True, exist_ok = True)
+    path.write_bytes(b"MZ")
+    return path
+
+
+def _make_windows_llama_layout(root: Path):
+    cpu_bin = _make_exe(root / "build" / "bin" / _EXE)
+    cpu_release = _make_exe(root / "build" / "bin" / "Release" / _EXE)
+    cuda_release = _make_exe(root / "build-cuda" / "bin" / "Release" / _EXE)
+    return cpu_bin, cpu_release, cuda_release
+
+
+def _isolate_llama_discovery(monkeypatch, home: Path):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_PATH", raising = False)
+    storage_stub = _types.ModuleType("utils.paths.storage_roots")
+    storage_stub.studio_root = lambda: home / ".unsloth" / "studio"
+    monkeypatch.setitem(sys.modules, "utils.paths.storage_roots", storage_stub)
+
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda *a, **k: None)
+
+
+def test_direct_llama_server_path_wins_without_nvidia_probe(tmp_path, monkeypatch):
+    direct = _make_exe(tmp_path / "direct" / _EXE)
+    _isolate_llama_discovery(monkeypatch, tmp_path / "home")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LLAMA_SERVER_PATH", str(direct))
+
+    def _boom():
+        raise AssertionError("LLAMA_SERVER_PATH should not probe nvidia")
+
+    monkeypatch.setattr(LlamaCppBackend, "_nvidia_available", staticmethod(_boom))
+
+    assert LlamaCppBackend._find_llama_server_binary() == str(direct)
+
+
+def test_custom_llama_root_prefers_cuda_before_cpu_build_bin(tmp_path, monkeypatch):
+    root = tmp_path / "custom"
+    _cpu_bin, _cpu_release, cuda_release = _make_windows_llama_layout(root)
+    _isolate_llama_discovery(monkeypatch, tmp_path / "home")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(root))
+    monkeypatch.setattr(LlamaCppBackend, "_nvidia_available", staticmethod(lambda: True))
+
+    assert LlamaCppBackend._find_llama_server_binary() == str(cuda_release)
+
+
+def test_home_llama_root_prefers_cuda_before_cpu_release(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    root = home / ".unsloth" / "llama.cpp"
+    _cpu_bin, _cpu_release, cuda_release = _make_windows_llama_layout(root)
+    _isolate_llama_discovery(monkeypatch, home)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(LlamaCppBackend, "_nvidia_available", staticmethod(lambda: True))
+
+    assert LlamaCppBackend._find_llama_server_binary() == str(cuda_release)
+
+
+def test_windows_without_nvidia_keeps_default_cpu_order(tmp_path, monkeypatch):
+    root = tmp_path / "custom"
+    cpu_bin, _cpu_release, _cuda_release = _make_windows_llama_layout(root)
+    _isolate_llama_discovery(monkeypatch, tmp_path / "home")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_PATH", str(root))
+    monkeypatch.setattr(LlamaCppBackend, "_nvidia_available", staticmethod(lambda: False))
+
+    assert LlamaCppBackend._find_llama_server_binary() == str(cpu_bin)
+
+
+def test_nvidia_available_false_on_timeout(monkeypatch):
+    def _raise(*a, **k):
+        raise subprocess.TimeoutExpired(cmd = "nvidia-smi", timeout = 5)
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+
+    assert LlamaCppBackend._nvidia_available() is False
