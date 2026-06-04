@@ -2090,7 +2090,7 @@ def openenv_vllm_reload_weights():
     original_src = src
 
     reload_weights_pattern = re.compile(
-        r"^(?P<indent>[ \t]*)trainer\.vllm_generation\.llm\.collective_rpc\(\s*(['\"])reload_weights\2\s*\)\s*$",
+        r"^(?P<indent>[ \t]*)(?P<obj>trainer\.vllm_generation\.llm)\.collective_rpc\(\s*(['\"])reload_weights\3\s*\)\s*$",
         re.MULTILINE,
     )
 
